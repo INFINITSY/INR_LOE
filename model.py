@@ -165,26 +165,26 @@ class DownConvImgEncoder(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
         self.cnn = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 2, 1),
+            nn.Conv2d(64, 64, 3, 1, 1),
             nn.ReLU(),
-            Conv2dResBlock(128, 128),
+            Conv2dResBlock(64, 64, downsample=True),
+            Conv2dResBlock(64, 128, downsample=True),
             Conv2dResBlock(128, 256, downsample=True),
-            Conv2dResBlock(256, 256),
             Conv2dResBlock(256, 512, downsample=True),
             nn.Conv2d(512, 512, 1, 1, 0)
         )
 
         self.relu_2 = nn.ReLU(inplace=True)
-        out_res = image_resolution // 8
-        self.fc = nn.Linear(512*out_res*out_res, out_channel)
+        # out_res = image_resolution // 4
+        self.fc = nn.Linear(512, out_channel)
 
 
     def forward(self, I):
-        o = self.relu(self.conv_theta(I))
-        o = self.relu_2(self.cnn(o))
+        o = self.relu(self.conv_theta(I)) # [B, 64, H, W]
+        o = self.relu_2(self.cnn(o)) # [B, 512, H//16, W//16]
 
-        o = o.view(o.shape[0], -1) # flatten
-        o = self.fc(o) # [B, 512]
+        o = o.permute(0, 2, 3, 1) # [B, H//16, W//16, 512]
+        o = self.fc(o) # [B, H//16, W//16, out_channel]
         # o = self.fc(self.relu_2(o).view(o.shape[0], 256, -1)).squeeze(-1)
         return o
     
@@ -215,9 +215,10 @@ class ResDownConvImgEncoder(nn.Module):
 
     def forward(self, x):
         # x = model_input['imgs'].permute(0, 3, 1, 2) # [B, C, H, W]
-        x = self.convs(x) # [B, 256]
-        x = self.relu(x) # [B, 256]
-        x = self.fc(x) # [B, out_dim]
+        x = self.convs(x) # [B, h, w, latent_size]
+        x = self.relu(x) 
+        x = self.fc(x) # [B, h, w, output_size]
+        x = x.view(-1, x.shape[-1]) # [B*h*w, output_size]
         return x
     
 
@@ -232,6 +233,24 @@ class ResNet18ImgEncoder(nn.Module):
         x = self.convs(x)
         return x
     
+class ResNet18NoMaxPoolImgEncoder(nn.Module):
+
+    def __init__(self, output_size):
+        super().__init__()
+        self.convs = torch.hub.load('pytorch/vision:v0.9.0', 'resnet18', pretrained=True)
+        # remove maxpool layer
+        self.convs.maxpool = nn.Identity()
+        # remove from avgpool layer
+        self.convs = nn.Sequential(*list(self.convs.children())[:-2])
+
+        self.fc = nn.Linear(512, output_size)
+
+    def forward(self, x):
+        x = self.convs(x) # [B, 512, H//16, W//16]
+        x = x.permute(0, 2, 3, 1) # [B, H//16, W//16, 512]
+        x = self.fc(x)
+        x = x.view(-1, x.shape[-1])
+        return x
 
 class MoECombiner(torch_geometric.nn.conv.MessagePassing):
     
@@ -317,13 +336,19 @@ class INRLoe(nn.Module):
             )
         self.net.append(nn.Linear(hidden_dim, output_dim * self.num_exps[-1]))
 
+        # print net weight shape
+        for i, layer in enumerate(self.net):
+            print(f'Layer {i}: {layer.weight.shape}')
+
         output_size = sum(self.num_exps) + hidden_dim * num_hidden + output_dim if self.bias \
             else sum(self.num_exps)
         # self.gate_module = ResDownConvImgEncoder(input_size=3, latent_size=512,
         #                                          output_size=output_size, 
         #                                          image_resolution=image_resolution)
 
-        self.gate_module = ResNet18ImgEncoder(output_size=output_size)
+        self.gate_module = ResNet18NoMaxPoolImgEncoder(output_size=output_size)
+        
+        # self.gate_module = ResNet18ImgEncoder(output_size=output_size)
         
         # self.gate_module = ResConvImgEncoder(input_size=3, output_size=sum(self.num_exps),
         #                                      image_resolution=image_resolution)
@@ -378,16 +403,15 @@ class INRLoe(nn.Module):
             zeros = torch.zeros_like(gate, requires_grad=True).to(gate.device)
             gates[i] = zeros.scatter(1, top_k_indices, top_k_gates) # clear entries out of activated gates
 
-        # if self.noisy_gating and self.k < self.num_experts and self.training:
-        #     load = (self._prob_in_top_k(clean_logits, noisy_logits, noise_stddev, top_logits)).sum(0)
-        # else:
-        #     load = self._gates_to_load(gates)
         return gates #, bias, load
         
     def forward(self, img, coords, top_k=False, softmax=False, 
                 noise_gates=[0, 0, 0, 0, 0], blend_alphas=[0, 0, 0, 0, 0]):
 
         raw_gates = self.gate_module(img) # N_imgs x sum(num_exps)
+        N_imgs = raw_gates.shape[0] # if not patchwise: batchsize, else batchsize * num_patches_per_img
+        N_coords = coords.shape[0]
+
         # split gates to according to self.num_exps
         if self.bias:
             gates = raw_gates[:, :sum(self.num_exps)] # N_imgs x sum(num_exps)
@@ -410,7 +434,8 @@ class INRLoe(nn.Module):
             gates = self.noisy_top_k_gating(img, gates)
         elif softmax:
             # apply softmax to each gate
-            gates = [F.softmax(gate, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
+            temp = 1.0
+            gates = [F.softmax(gate / temp, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
         else:
             # l2 normalize each gate
             gates = [F.normalize(gate, p=2, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
@@ -420,9 +445,6 @@ class INRLoe(nn.Module):
             gates[i] = alpha / self.num_exps[i] + (1 - alpha) * gates[i]
 
         importance = [torch.sum(gate, dim=0) for gate in gates] # len(num_exps) x num_exps[i]
-
-        N_imgs = img.shape[0]
-        N_coords = coords.shape[0]
         
         # x = self.map(coords) # N_coords x in_dim
         x = coords

@@ -35,40 +35,96 @@ def entropy_regularization(output, beta=0.1):
     entropy = -torch.sum(output * torch.log(output + 1e-5), dim=1).mean()
     return beta * entropy
 
+@torch.no_grad()
+def render(args, epoch, model, render_loader, coords_loader, blend_alphas, test=False):
+    model.eval()
+    
+    for i, (img, idx) in enumerate(render_loader):
+        img, idx = img.cuda(), idx.cuda()
+        N, C, H, W = img.shape
+        out_all = []
+        for coords, i_sel in coords_loader:
+            coords, i_sel = coords.cuda(), i_sel.cuda()
+
+            out, gates, _ = model(img, coords, args.top_k, args.softmax,
+                                  blend_alphas=blend_alphas)
+            
+            out_all.append(out)
+        
+        out_all = torch.cat(out_all, 1)
+
+        if args.patch_size is not None:
+            n_patches = args.side_length // args.patch_size
+            out_all = out_all.reshape(N, n_patches, n_patches, args.patch_size, args.patch_size, C)
+            out_all = out_all.permute(0, 1, 3, 2, 4, 5) # [N, N_patches, P, N_patches, P, C]
+
+        out = out_all.reshape(N, args.side_length, args.side_length, C)
+        # clip the output to [0, 1]
+        out = torch.clamp(out, 0, 1)
+        img = img.permute(0, 2, 3, 1)
+        # display img and out side by side
+        fig, axes = plt.subplots(N, 2, figsize=(2, 5))
+        for i in range(N):
+            axes[i, 0].imshow(img[i].cpu())
+            axes[i, 1].imshow(out[i].cpu())
+
+        if test:
+            plt.savefig(os.path.join(args.save, "output_test_e_{}.png".format(epoch)))
+        else:
+            plt.savefig(os.path.join(args.save, "output_train_e_{}.png".format(epoch)))
+
+            gates = [gate.detach().cpu().numpy() for gate in gates]
+            fig, axes = plt.subplots(1, len(gates), figsize=(16, 4))
+            for j, gate in enumerate(gates):
+                cax = axes[j].imshow(gate, aspect='auto')
+                axes[j].set_yticks([])
+                axes[j].set_xticks([0, gate.shape[1]-1])
+                cbar = fig.colorbar(cax, ax=axes[j], orientation='horizontal')
+                min_val, max_val = gate.min(), gate.max()
+                cbar.set_ticks([min_val, max_val])
+            plt.subplots_adjust(wspace=0.4)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.save, "gates_train_e_{}.png".format(epoch)), 
+                        bbox_inches='tight', dpi=300)
+        # close the figure
+        plt.close('all')
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root_dir', type=str, default='data/celeba64')
+    parser.add_argument('--root_dir', type=str, default='/home/s99tang/Research/neural_dynamic/data/celeba64')
     parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
-    parser.add_argument('--train_subset', type=int, default=500)
-    parser.add_argument('--test_subset', type=int, default=10)
+    parser.add_argument('--train_subset', type=int, default=50)
+    parser.add_argument('--render_subset', type=int, default=3)
     parser.add_argument('--side_length', type=int, default=64)
-    parser.add_argument('--batch_size', type=int, default=6)
+    parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--chunk_size', type=int, default=1024)
-    parser.add_argument('--render_size', type=int, default=4)
+    parser.add_argument('--patch_size', type=int, default=16)
 
     # train params
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--epochs_render', type=int, default=10)
-    parser.add_argument('--epochs_save', type=int, default=10)
+    parser.add_argument('--epochs_render', type=int, default=1)
+    parser.add_argument('--epochs_save', type=int, default=5)
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--cv_loss', type=float, default=0.01, help='weight for cv loss')
+    parser.add_argument('--separate_optim', type=bool, default=True, help='separately update net and gates')
 
     # model configs
     parser.add_argument('--top_k', action='store_true', help='whether to use top k sparce gates')
-    parser.add_argument('--softmax', action='store_true', help='whether to use softmax on gates')
+    parser.add_argument('--softmax', type=bool, default=True, help='whether to use softmax on gates')
     parser.add_argument('--bias', action='store_true', help='use bias on weighted experts')
-    parser.add_argument('--merge_before_act', action='store_true', help='merge experts before nl act')
+    parser.add_argument('--merge_before_act', type=bool, default=True, help='merge experts before nl act')
     parser.add_argument('--num_exps', nargs='+', type=int, default=[8, 16, 64, 256, 1024])
-    parser.add_argument('--ks', nargs='+', type=int, default=[4, 4, 32, 32, 256])
-    parser.add_argument('--progressive_epoch', type=int, default=15, help='progressively enable experts for each layer')
+    parser.add_argument('--ks', nargs='+', type=int, default=[4, 8, 32, 128, 256])
+    parser.add_argument('--progressive_epoch', type=int, default=10, help='progressively enable experts for each layer')
     parser.add_argument('--progressive_reverse', action='store_true', help='reverse the progressive enablement')
     
     parser.add_argument('--wandb', action='store_true')
     parser.add_argument('--save', type=str, default='save')
-    parser.add_argument('--exp_cmt', type=str, default='DEFAULT')
+    parser.add_argument('--exp_cmt', type=str, default='patch_test_res18')
 
     args = parser.parse_args()
 
@@ -82,6 +138,11 @@ if __name__ == '__main__':
     fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
     fh.setFormatter(logging.Formatter(log_format))
     logging.getLogger().addHandler(fh)
+
+    # log all input arguments
+    for arg in vars(args):
+        if arg != 'root_dir':
+            logging.info(f"{arg}: {getattr(args, arg)}")
 
     if args.wandb:
         wandb.init(project="inr-loe")
@@ -101,16 +162,21 @@ if __name__ == '__main__':
 
 
     # dataset = CIFAR10Dataset(root='data', class_label=5)
-    dataset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
+    trainset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
                             downsampled_size=(args.side_length, args.side_length))
-    testset = CelebADataset(root=args.root_dir, split='test', subset=args.test_subset,
+    train_testset = CelebADataset(root=args.root_dir, split='train', subset=args.render_subset,
                             downsampled_size=(args.side_length, args.side_length))
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    train_testloader = torch.utils.data.DataLoader(dataset, batch_size=args.render_size, shuffle=False, num_workers=4)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=args.render_size, shuffle=False, num_workers=4)
+    testset = CelebADataset(root=args.root_dir, split='test', subset=args.render_subset,
+                            downsampled_size=(args.side_length, args.side_length))
+    
+    dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    train_testloader = torch.utils.data.DataLoader(train_testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    coordset = LatticeDataset(image_shape=(args.side_length, args.side_length))
+    img_size = args.side_length if args.patch_size is None else args.patch_size
+    coordset = LatticeDataset(image_shape=(img_size, img_size))
     coords_loader = torch.utils.data.DataLoader(coordset, pin_memory=True, batch_size=args.chunk_size, shuffle=True)
+    valid_coords = torch.utils.data.DataLoader(coordset, pin_memory=True, batch_size=args.chunk_size, shuffle=False)
 
     optim_gates = torch.optim.Adam(inr_loe.gate_module.parameters(), lr=args.lr, weight_decay=1e-5)
     optim_net = torch.optim.Adam(inr_loe.net.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -144,15 +210,26 @@ if __name__ == '__main__':
 
         # iterate over the images
         for i, (img, idx) in enumerate(dataloader):
-            img = img.cuda() # N_imgs x 3 x 32 x 32
+            img = img.cuda() # N_imgs x 3 x 64 x 64
             idx = idx.cuda() # N_imgs
             # N_imgs = img.shape[0]
+            if args.patch_size is not None:
+                img_perm = img.permute(0, 2, 3, 1) # N_imgs x 64 x 64 x 3
+                n_patches = args.side_length // args.patch_size
+                img_reshaped = img_perm.reshape(img_perm.size(0), n_patches, args.patch_size, 
+                                                n_patches, args.patch_size, img_perm.size(-1))
+                img_transposed = img_reshaped.permute(0, 1, 3, 2, 4, 5)
+                img_patch = img_transposed.reshape(-1, args.patch_size, args.patch_size, img_perm.size(-1))
+                # img_patch: [N_imgs x N_patches x N_patches] x 16 x 16 x 3
+                img_gt = img_patch.permute(0, 3, 1, 2)
+            else:
+                img_gt = img
 
             # iterate over the coords
             for coords, i_sel in coords_loader:
                 coords, i_sel = coords.cuda(), i_sel.cuda()
-                B, C, H, W = img.shape
-                y = img.reshape(B, C, -1)[:, :, i_sel]
+                N, C, H, W = img_gt.shape
+                y = img_gt.reshape(N, C, -1)[:, :, i_sel]
                 y = y.permute(0, 2, 1) # N_imgs x N_coords x 3
 
                 out, gates, importance = inr_loe(img, coords, args.top_k, args.softmax, 
@@ -161,7 +238,7 @@ if __name__ == '__main__':
                 mse = criterion(out, y)
 
                 if args.top_k: 
-                    loss = mse #+ sparsity#+ entropy_loss * 0.1
+                    loss = mse 
                 else:
                     # sparsity = 0
                     variance = 0
@@ -184,12 +261,17 @@ if __name__ == '__main__':
                 mse = mse.item()
                 psnr = 10 * np.log10(1 / mse) # shape is N_imgs
 
-                optim_net.zero_grad()
-                optim_gates.zero_grad()
                 loss.backward()
                 optim_net.step()
-                optim_gates.step()
+                optim_net.zero_grad()
 
+                if not args.separate_optim:
+                    optim_gates.step()
+                    optim_gates.zero_grad()
+            
+            if args.separate_optim:
+                optim_gates.step()
+                optim_gates.zero_grad()
 
             if i % 25 == 0:
                 logging.info("Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}".format(
@@ -199,76 +281,8 @@ if __name__ == '__main__':
 
         if epoch % args.epochs_render == 0:
             inr_loe.eval()
-            for img, idx in train_testloader:
-                img = img.cuda()
-                idx = idx.cuda()
-                N = img.shape[0]
-                coords = get_mgrid(args.side_length).cuda()
-                # split coords into chunks of 128
-                coords = coords.view(-1, 128, 2) 
-                with torch.no_grad():
-                    for i in range(0, coords.shape[0]):
-                        out, gates, _ = inr_loe(img, coords[i],
-                                                blend_alphas=blend_alphas) 
-                        if i == 0:
-                            out_all = out
-                        else:
-                            out_all = torch.cat((out_all, out), dim=1)
-                    # out, gates, _ = inr_loe(img, coords)
-                    
-                    # display the output image
-                    # out = out.view(N, args.side_length, args.side_length, 3)
-                    out = out_all.view(N, args.side_length, args.side_length, 3)
-                    # clip the output to [0, 1]
-                    out = torch.clamp(out, 0, 1)
-                    img = img.permute(0, 2, 3, 1)
-                    # display img and out side by side
-                    fig, axes = plt.subplots(N, 2, figsize=(2, 5))
-                    for i in range(N):
-                        axes[i, 0].imshow(img[i].cpu())
-                        axes[i, 1].imshow(out[i].cpu())
-                    plt.savefig(os.path.join(args.save, "output_train_e_{}.png".format(epoch)))
-
-                    gates = [gate.detach().cpu().numpy() for gate in gates]
-                    # visualize the gates
-                    fig, axes = plt.subplots(1, len(gates), figsize=(15, 5))
-                    for j, gate in enumerate(gates):
-                        # diaplay matrix
-                        axes[j].imshow(gate)
-                    # save the figure
-                    plt.savefig(os.path.join(args.save, "gates_train_e_{}.png".format(epoch)))
-
-                    break
-            for img, idx in testloader:
-                img = img.cuda()
-                idx = idx.cuda()
-                N = img.shape[0]
-                coords = get_mgrid(args.side_length).cuda()
-                # split coords into chunks of 128
-                coords = coords.view(-1, 128, 2) 
-                with torch.no_grad():
-                    for i in range(0, coords.shape[0]):
-                        out, gates, _ = inr_loe(img, coords[i],
-                                                blend_alphas=blend_alphas) 
-                        if i == 0:
-                            out_all = out
-                        else:
-                            out_all = torch.cat((out_all, out), dim=1)
-                    
-                    # display the output image
-                    out = out_all.view(N, args.side_length, args.side_length, 3)
-                    # clip the output to [0, 1]
-                    out = torch.clamp(out, 0, 1)
-                    img = img.permute(0, 2, 3, 1)
-                    # display img and out side by side
-                    fig, axes = plt.subplots(N, 2, figsize=(2, 5))
-                    for i in range(N):
-                        axes[i, 0].imshow(img[i].cpu())
-                        axes[i, 1].imshow(out[i].cpu())
-                    plt.savefig(os.path.join(args.save, "output_test_e_{}.png".format(epoch)))
-                    break
-            # close the figure
-            plt.close('all')
+            render(args, epoch, inr_loe, train_testloader, valid_coords, blend_alphas)
+            render(args, epoch, inr_loe, testloader, valid_coords, blend_alphas, test=True)
 
         logging.info("Epoch: {}, Loss: {:.4f}, PSNR: {:.4f}".format(epoch, loss.item(), psnr.mean()))
 
@@ -277,4 +291,4 @@ if __name__ == '__main__':
         if epoch % args.epochs_save == 0:
             logging.info("Saving model...")
             torch.save(inr_loe.state_dict(), os.path.join(args.save, "inr_loe_{}.pt".format(epoch)))
-
+        
