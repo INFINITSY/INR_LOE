@@ -302,7 +302,7 @@ class INRLoe(nn.Module):
                  num_exps=[8, 16, 64, 256, 1024], 
                  ks = [4, 4, 32, 32, 256],
                  noisy_gating=False, noise_module=None,
-                 merge_before_act=False, bias=False):
+                 merge_before_act=False, bias=False, patchwise=False):
         super(INRLoe, self).__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -345,9 +345,11 @@ class INRLoe(nn.Module):
         # self.gate_module = ResDownConvImgEncoder(input_size=3, latent_size=512,
         #                                          output_size=output_size, 
         #                                          image_resolution=image_resolution)
+        if patchwise:
+            self.gate_module = ResNet18NoMaxPoolImgEncoder(output_size=output_size)
+        else:
+            self.gate_module = ResNet18ImgEncoder(output_size=output_size)
 
-        self.gate_module = ResNet18NoMaxPoolImgEncoder(output_size=output_size)
-        
         # self.gate_module = ResNet18ImgEncoder(output_size=output_size)
         
         # self.gate_module = ResConvImgEncoder(input_size=3, output_size=sum(self.num_exps),

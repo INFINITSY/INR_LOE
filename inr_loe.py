@@ -97,7 +97,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
-    parser.add_argument('--train_subset', type=int, default=50)
+    parser.add_argument('--train_subset', type=int, default=5000)
     parser.add_argument('--render_subset', type=int, default=3)
     parser.add_argument('--side_length', type=int, default=64)
     parser.add_argument('--batch_size', type=int, default=3)
@@ -153,7 +153,8 @@ if __name__ == '__main__':
                      ks=args.ks,
                      image_resolution=args.side_length, 
                      merge_before_act=args.merge_before_act, 
-                     bias=args.bias).cuda()
+                     bias=args.bias,
+                     patchwise=(args.patch_size is not None)).cuda()
 
     # count the number of parameters
     params = sum(p.numel() for p in inr_loe.parameters())
