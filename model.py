@@ -301,6 +301,7 @@ class INRLoe(nn.Module):
                  num_hidden=4, image_resolution=32,
                  num_exps=[8, 16, 64, 256, 1024], 
                  ks = [4, 4, 32, 32, 256],
+                 latent_size=512,
                  noisy_gating=False, noise_module=None,
                  merge_before_act=False, bias=False, patchwise=False):
         super(INRLoe, self).__init__()
@@ -345,16 +346,12 @@ class INRLoe(nn.Module):
         # self.gate_module = ResDownConvImgEncoder(input_size=3, latent_size=512,
         #                                          output_size=output_size, 
         #                                          image_resolution=image_resolution)
-        if patchwise:
-            self.gate_module = ResNet18NoMaxPoolImgEncoder(output_size=output_size)
-        else:
-            self.gate_module = ResNet18ImgEncoder(output_size=output_size)
+        # if patchwise:
+        #     self.gate_module = ResNet18NoMaxPoolImgEncoder(output_size=output_size)
+        # else:
+        #     self.gate_module = ResNet18ImgEncoder(output_size=output_size)
 
-        # self.gate_module = ResNet18ImgEncoder(output_size=output_size)
-        
-        # self.gate_module = ResConvImgEncoder(input_size=3, output_size=sum(self.num_exps),
-        #                                      image_resolution=image_resolution)
-        # self.gate_module = CodebookImgEncoder(num_images=5000, output_size=sum(self.num_exps))
+        self.gate_module = nn.Linear(latent_size, output_size)
 
         self.combiner = MoECombiner()
 
@@ -407,10 +404,10 @@ class INRLoe(nn.Module):
 
         return gates #, bias, load
         
-    def forward(self, img, coords, top_k=False, softmax=False, 
+    def forward(self, latents, coords, top_k=False, softmax=False, 
                 noise_gates=[0, 0, 0, 0, 0], blend_alphas=[0, 0, 0, 0, 0]):
 
-        raw_gates = self.gate_module(img) # N_imgs x sum(num_exps)
+        raw_gates = self.gate_module(latents) # N_imgs x sum(num_exps)
         N_imgs = raw_gates.shape[0] # if not patchwise: batchsize, else batchsize * num_patches_per_img
         N_coords = coords.shape[0]
 
@@ -430,10 +427,10 @@ class INRLoe(nn.Module):
         # add noise to gates
         if not self.training:
             for gate, noise in zip(gates, noise_gates):
-                gate += noise * torch.randn_like(gate)
+                gate = gate + noise * torch.randn_like(gate)
         
         if top_k:
-            gates = self.noisy_top_k_gating(img, gates)
+            gates = self.noisy_top_k_gating(latents, gates)
         elif softmax:
             # apply softmax to each gate
             temp = 1.0

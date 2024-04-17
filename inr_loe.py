@@ -14,6 +14,24 @@ from model import INRLoe
 import wandb
 import argparse
 
+
+def compute_loss(out, y, criterion, importance=None, top_k=False, cv_loss=0.01):
+    mse = criterion(out, y)
+    if top_k: 
+        loss = mse 
+    else:
+        cv_loss = []
+        for l, v in enumerate(importance):
+            cv_loss.append(cv_squared_loss(v))
+            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                # only calculate the cv loss for active layers
+                break
+        cv_loss = torch.stack(cv_loss).mean()
+        loss = mse + cv_loss * cv_loss
+
+    return loss, mse
+
+
 def cv_squared_loss(x, eps=1e-10):
     """The squared coefficient of variation of a sample.
     Useful as a loss to encourage a positive distribution to be more uniform.
@@ -35,7 +53,7 @@ def entropy_regularization(output, beta=0.1):
     entropy = -torch.sum(output * torch.log(output + 1e-5), dim=1).mean()
     return beta * entropy
 
-@torch.no_grad()
+# @torch.no_grad()
 def render(args, epoch, model, render_loader, coords_loader, blend_alphas, test=False):
     model.eval()
     
@@ -43,12 +61,29 @@ def render(args, epoch, model, render_loader, coords_loader, blend_alphas, test=
         img, idx = img.cuda(), idx.cuda()
         N, C, H, W = img.shape
         out_all = []
+
+        # reset the latents: random sample from N(0, 1)
+        latents = torch.randn(img.size(0), args.latent_size).cuda() 
+        latents.requires_grad = True
+        
         for coords, i_sel in coords_loader:
             coords, i_sel = coords.cuda(), i_sel.cuda()
+            y = img.reshape(N, C, -1)[:, :, i_sel]
+            y = y.permute(0, 2, 1) # N_imgs x N_coords x 3
 
-            out, gates, _ = model(img, coords, args.top_k, args.softmax,
-                                  blend_alphas=blend_alphas)
+            # inner loop for latents update
+            for _ in range(args.inner_steps):
+                out, _, importance = inr_loe(latents, coords, args.top_k, args.softmax,
+                                             blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
+
+                loss, _ = compute_loss(out, y, criterion, importance, args.top_k, args.cv_loss)
+                latent_gradients = \
+                        torch.autograd.grad(loss, latents, create_graph=True)[0]
+                latents = latents - args.lr_inner * latent_gradients
             
+            with torch.no_grad():
+                out, gates, _ = inr_loe(latents, coords, args.top_k, args.softmax,
+                                        blend_alphas=blend_alphas)
             out_all.append(out)
         
         out_all = torch.cat(out_all, 1)
@@ -97,31 +132,33 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
-    parser.add_argument('--train_subset', type=int, default=5000)
-    parser.add_argument('--render_subset', type=int, default=3)
+    parser.add_argument('--train_subset', type=int, default=50)
+    parser.add_argument('--render_subset', type=int, default=2)
     parser.add_argument('--side_length', type=int, default=64)
-    parser.add_argument('--batch_size', type=int, default=3)
-    parser.add_argument('--chunk_size', type=int, default=1024)
-    parser.add_argument('--patch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--chunk_size', type=int, default=4096)
+    parser.add_argument('--patch_size', type=int, default=None)
 
     # train params
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--epochs_render', type=int, default=1)
     parser.add_argument('--epochs_save', type=int, default=5)
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
+    parser.add_argument('--lr_inner', type=float, default=0.1, help='learning rate for inner loop')
     parser.add_argument('--cv_loss', type=float, default=0.01, help='weight for cv loss')
-    parser.add_argument('--separate_optim', type=bool, default=True, help='separately update net and gates')
+    parser.add_argument('--inner_steps', type=int, default=3, help='number of inner steps for each coords')
 
     # model configs
     parser.add_argument('--top_k', action='store_true', help='whether to use top k sparce gates')
     parser.add_argument('--softmax', type=bool, default=True, help='whether to use softmax on gates')
     parser.add_argument('--bias', action='store_true', help='use bias on weighted experts')
     parser.add_argument('--merge_before_act', type=bool, default=True, help='merge experts before nl act')
-    parser.add_argument('--num_exps', nargs='+', type=int, default=[8, 16, 64, 256, 1024])
+    parser.add_argument('--num_exps', nargs='+', type=int, default=[8, 16, 64, 64, 64])
     parser.add_argument('--ks', nargs='+', type=int, default=[4, 8, 32, 128, 256])
-    parser.add_argument('--progressive_epoch', type=int, default=10, help='progressively enable experts for each layer')
+    parser.add_argument('--progressive_epoch', type=int, default=None, help='progressively enable experts for each layer')
     parser.add_argument('--progressive_reverse', action='store_true', help='reverse the progressive enablement')
-    
+    parser.add_argument('--latent_size', type=int, default=256, help='size of the latent space')
+
     parser.add_argument('--wandb', action='store_true')
     parser.add_argument('--save', type=str, default='save')
     parser.add_argument('--exp_cmt', type=str, default='patch_test_res18')
@@ -154,7 +191,9 @@ if __name__ == '__main__':
                      image_resolution=args.side_length, 
                      merge_before_act=args.merge_before_act, 
                      bias=args.bias,
-                     patchwise=(args.patch_size is not None)).cuda()
+                     patchwise=(args.patch_size is not None),
+                     latent_size=args.latent_size
+                     ).cuda()
 
     # count the number of parameters
     params = sum(p.numel() for p in inr_loe.parameters())
@@ -179,8 +218,7 @@ if __name__ == '__main__':
     coords_loader = torch.utils.data.DataLoader(coordset, pin_memory=True, batch_size=args.chunk_size, shuffle=True)
     valid_coords = torch.utils.data.DataLoader(coordset, pin_memory=True, batch_size=args.chunk_size, shuffle=False)
 
-    optim_gates = torch.optim.Adam(inr_loe.gate_module.parameters(), lr=args.lr, weight_decay=1e-5)
-    optim_net = torch.optim.Adam(inr_loe.net.parameters(), lr=args.lr, weight_decay=1e-5)
+    optim_net = torch.optim.Adam(inr_loe.parameters(), lr=args.lr, weight_decay=1e-5)
 
     criterion = nn.MSELoss()
 
@@ -208,7 +246,6 @@ if __name__ == '__main__':
                 else:
                     blend_alphas[l] = alpha
 
-
         # iterate over the images
         for i, (img, idx) in enumerate(dataloader):
             img = img.cuda() # N_imgs x 3 x 64 x 64
@@ -226,6 +263,11 @@ if __name__ == '__main__':
             else:
                 img_gt = img
 
+            # reset the latents: random sample from N(0, 1) 
+            # shape: N_imgs x latent_size
+            latents = torch.randn(img.size(0), args.latent_size).cuda() 
+            latents.requires_grad = True
+
             # iterate over the coords
             for coords, i_sel in coords_loader:
                 coords, i_sel = coords.cuda(), i_sel.cuda()
@@ -233,46 +275,28 @@ if __name__ == '__main__':
                 y = img_gt.reshape(N, C, -1)[:, :, i_sel]
                 y = y.permute(0, 2, 1) # N_imgs x N_coords x 3
 
-                out, gates, importance = inr_loe(img, coords, args.top_k, args.softmax, 
+                # inner loop for latents update
+                for _ in range(args.inner_steps):
+                    out, _, importance = inr_loe(latents, coords, args.top_k, args.softmax, 
                                                  blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
-
-                mse = criterion(out, y)
-
-                if args.top_k: 
-                    loss = mse 
-                else:
-                    # sparsity = 0
-                    variance = 0
-                    for g in gates:
-                        # calculate the variance of each column in the gate matrix
-                        variance += torch.var(g, dim=0).mean()
-
-                    cv_loss = []
-                    if args.progressive_reverse:
-                        importance = importance[::-1]
-                    for l, v in enumerate(importance):
-                        cv_loss.append(cv_squared_loss(v))
-                        if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
-                            # only calculate the cv loss for active layers
-                            break
-                    cv_loss = torch.stack(cv_loss).mean()
                     
-                    loss = mse + cv_loss * args.cv_loss
+                    loss, _ = compute_loss(out, y, criterion, importance, args.top_k, args.cv_loss)
+                    latent_gradients = \
+                        torch.autograd.grad(loss, latents, create_graph=True)[0]
+                    latents = latents - args.lr_inner * latent_gradients
+
+                # update the shared weights
+                out, _, importance = inr_loe(latents, coords, args.top_k, args.softmax, 
+                                             blend_alphas=blend_alphas)
+                
+                loss, mse = compute_loss(out, y, criterion, importance, args.top_k, args.cv_loss)
+                optim_net.zero_grad()
+                loss.backward()
+                optim_net.step()
+                
                 # compute psnr
                 mse = mse.item()
                 psnr = 10 * np.log10(1 / mse) # shape is N_imgs
-
-                loss.backward()
-                optim_net.step()
-                optim_net.zero_grad()
-
-                if not args.separate_optim:
-                    optim_gates.step()
-                    optim_gates.zero_grad()
-            
-            if args.separate_optim:
-                optim_gates.step()
-                optim_gates.zero_grad()
 
             if i % 25 == 0:
                 logging.info("Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}".format(
@@ -281,7 +305,6 @@ if __name__ == '__main__':
                     wandb.log({"loss": loss.item(), "psnr": psnr.mean()})
 
         if epoch % args.epochs_render == 0:
-            inr_loe.eval()
             render(args, epoch, inr_loe, train_testloader, valid_coords, blend_alphas)
             render(args, epoch, inr_loe, testloader, valid_coords, blend_alphas, test=True)
 
