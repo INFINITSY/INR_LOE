@@ -296,12 +296,62 @@ class MoECombiner(torch_geometric.nn.conv.MessagePassing):
     def message(self, x_j, x_i, edge_weights):
         return x_j * edge_weights
 
+class ConditionalGateModule(nn.Module):
+    def __init__(self, latent_size, num_exps=[64, 64, 64, 64]):
+        super().__init__()
+        self.num_exps = num_exps
+        self.nets = nn.ModuleList()
+        # output gating vector for each layer plus mean and std for subsequent layer
+        for i in range(len(num_exps)-1):
+            self.nets.append(nn.Linear(latent_size, num_exps[i] + 2 * latent_size))
+        self.nets.append(nn.Linear(latent_size, num_exps[-1]))
+
+        # init output of each layer to be uniform
+        for i, net in enumerate(self.nets):
+            if i < len(self.nets) - 1:
+                net.bias.data[:num_exps[i]].fill_(1/num_exps[i])
+                # init mean and log_var to be 0
+                net.bias.data[num_exps[i]:].fill_(0)
+            else:
+                net.bias.data.fill_(1/num_exps[-1])
+
+    def forward(self, latents):
+        # latents is N_imgs x N_layers x latent_size
+        latent_size = latents.shape[-1]
+        gates = []
+        means = []
+        log_vars = []
+        mean = torch.zeros_like(latents[:, 0]) # N_imgs x latent_size
+        log_var = torch.zeros_like(latents[:, 0]) # N_imgs x latent_size
+        for i, net in enumerate(self.nets):
+            if i < len(self.nets) - 1:
+                std = torch.exp(0.5 * log_var)
+                latents_rprm = mean + std * latents[:, i] # N_imgs x latent_size
+                gate_raw = net(latents_rprm) # N_imgs x (num_exps[i] + 2 * latent_size)
+                gate = gate_raw[:, :self.num_exps[i]] # N_imgs x num_exps[i]
+                gates.append(gate)
+
+                # for the next layer
+                mean = gate_raw[:, self.num_exps[i]:-latent_size] # N_imgs x latent_size
+                log_var = gate_raw[:, -latent_size:] # N_imgs x latent_size
+                # record mean and log_var
+                means.append(mean)
+                log_vars.append(log_var)
+            else:
+                std = torch.exp(0.5 * log_var)
+                latents_rprm = mean + std * latents[:, i] # N_imgs x latent_size
+                gates.append(net(latents_rprm))
+                # gates.append(net(latents[:, i])) # N_imgs x num_exps[-1]
+                
+        return torch.cat(gates, dim=1), means, log_vars
+        
+
 class INRLoe(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=256, output_dim=3, 
                  num_hidden=4, image_resolution=32,
                  num_exps=[8, 16, 64, 256, 1024], 
                  ks = [4, 4, 32, 32, 256],
-                 latent_size=512,
+                 latent_size=512, conditional=False,
                  noisy_gating=False, noise_module=None,
                  merge_before_act=False, bias=False, patchwise=False):
         super(INRLoe, self).__init__()
@@ -315,6 +365,7 @@ class INRLoe(nn.Module):
         self.noisy_gating = noisy_gating
         self.merge_before_act = merge_before_act
         self.bias = bias
+        self.conditional = conditional
         # self.top_k = top_k
 
         if self.noisy_gating and noise_module is not None:
@@ -351,7 +402,14 @@ class INRLoe(nn.Module):
         # else:
         #     self.gate_module = ResNet18ImgEncoder(output_size=output_size)
 
-        self.gate_module = nn.Linear(latent_size, output_size)
+        # self.gate_module = 
+        if self.conditional:
+            self.gate_module = ConditionalGateModule(latent_size, num_exps=self.num_exps)
+        else:
+            self.gate_module = nn.Linear(latent_size, output_size)
+            for i, num_exp in enumerate(self.num_exps):
+                self.gate_module.bias.data[i*num_exp:(i+1)*num_exp].fill_(1/num_exp)
+
 
         self.combiner = MoECombiner()
 
@@ -359,6 +417,11 @@ class INRLoe(nn.Module):
         self.net.apply(sine_init)
 
         self.net[0].apply(first_layer_sine_init)
+
+        # for i, num_exp in enumerate(self.num_exps):
+        #     self.gate_module.bias.data[i*num_exp:(i+1)*num_exp].fill_(1/num_exp)
+        # zero init the weights
+        # self.gate_module.weight.data.zero_()
 
     def noisy_top_k_gating(self, x, raw_gates, noise_epsilon=1e-2):
         """Noisy top-k gating.
@@ -407,7 +470,8 @@ class INRLoe(nn.Module):
     def forward(self, latents, coords, top_k=False, softmax=False, 
                 noise_gates=[0, 0, 0, 0, 0], blend_alphas=[0, 0, 0, 0, 0]):
 
-        raw_gates = self.gate_module(latents) # N_imgs x sum(num_exps)
+        raw_gates, means, log_vars = self.gate_module(latents) # N_imgs x sum(num_exps)
+        mu_var = {'means': means, 'log_vars': log_vars}
         N_imgs = raw_gates.shape[0] # if not patchwise: batchsize, else batchsize * num_patches_per_img
         N_coords = coords.shape[0]
 
@@ -435,9 +499,9 @@ class INRLoe(nn.Module):
             # apply softmax to each gate
             temp = 1.0
             gates = [F.softmax(gate / temp, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
-        else:
-            # l2 normalize each gate
-            gates = [F.normalize(gate, p=2, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
+        # else:
+        #     # l2 normalize each gate
+        #     gates = [F.normalize(gate, p=2, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
         
         # blend the gates with uniform weights
         for i, alpha in enumerate(blend_alphas):
@@ -477,8 +541,10 @@ class INRLoe(nn.Module):
             # apply non-linearity except for the last layer
             if i < len(self.net) - 1 and self.merge_before_act:
                 x = self.nl(x)
+        
+        x = torch.sigmoid(x)
 
-        return x, gates, importance
+        return x, gates, importance, mu_var
 
 
 def init_weights_relu(m):
