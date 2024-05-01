@@ -180,6 +180,36 @@ class CIFAR10Dataset(torch.utils.data.Dataset):
         # return torch.mean(self.images[idx][0], dim=-1, keepdim=True), torch.tensor(idx, dtype=torch.int64)
         return self.images[idx][0], torch.tensor(idx, dtype=torch.int64)
     
+class LatentsDataset(torch.utils.data.Dataset):
+    def __init__(self, latents_path, flat=True, subset=-1):
+        super().__init__()
+        self.latents = torch.load(latents_path)
+        if flat:
+            self.latents = self.latents.view(self.latents.shape[0], -1)
+        if subset > 0:
+            self.latents = self.latents[:subset]
+
+        # normalization
+        self.mean = self.latents.mean(dim=0).detach()
+        self.std = self.latents.std(dim=0).detach()
+
+    @property
+    def num_latents(self):
+        return self.latents.shape[0]
+
+    @property
+    def latent_size(self):
+        return self.latents.shape[1:]
+
+    def __len__(self):
+        return self.num_latents
+
+    def __getitem__(self, idx):
+        latent = self.latents[idx]
+        latent = (latent - self.mean) / self.std
+
+        return latent, torch.tensor(idx, dtype=torch.int64)
+    
 
 if __name__ == '__main__':
     import matplotlib.pyplot as plt

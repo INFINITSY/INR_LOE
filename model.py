@@ -6,6 +6,7 @@ import math
 import matplotlib.pyplot as plt
 import torch_geometric
 from datasets import CIFAR10Dataset, LatticeDataset
+from meta import MetaModule, MetaSequential, BatchLinear
 
 ### Taken from official SIREN repo
 class Sine(nn.Module):
@@ -323,14 +324,15 @@ class ConditionalGateModule(nn.Module):
         log_vars = []
         mean = torch.zeros_like(latents[:, 0]) # N_imgs x latent_size
         log_var = torch.zeros_like(latents[:, 0]) # N_imgs x latent_size
-        for i, net in enumerate(self.nets):
-            if i < len(self.nets) - 1:
-                std = torch.exp(0.5 * log_var)
-                latents_rprm = mean + std * latents[:, i] # N_imgs x latent_size
-                gate_raw = net(latents_rprm) # N_imgs x (num_exps[i] + 2 * latent_size)
-                gate = gate_raw[:, :self.num_exps[i]] # N_imgs x num_exps[i]
-                gates.append(gate)
 
+        for i, net in enumerate(self.nets):
+            # reparametrize the latents
+            std = torch.exp(0.5 * log_var)
+            latents_rprm = mean + std * latents[:, i] # N_imgs x latent_size
+            gate_raw = net(latents_rprm) # N_imgs x (num_exps[i] + 2 * latent_size)
+
+            if i < len(self.nets) - 1:
+                gates.append(gate_raw[:, :self.num_exps[i]]) # N_imgs x num_exps[i]
                 # for the next layer
                 mean = gate_raw[:, self.num_exps[i]:-latent_size] # N_imgs x latent_size
                 log_var = gate_raw[:, -latent_size:] # N_imgs x latent_size
@@ -338,59 +340,95 @@ class ConditionalGateModule(nn.Module):
                 means.append(mean)
                 log_vars.append(log_var)
             else:
-                std = torch.exp(0.5 * log_var)
-                latents_rprm = mean + std * latents[:, i] # N_imgs x latent_size
-                gates.append(net(latents_rprm))
-                # gates.append(net(latents[:, i])) # N_imgs x num_exps[-1]
-                
+                gates.append(gate_raw) # N_imgs x num_exps[-1]
+
         return torch.cat(gates, dim=1), means, log_vars
         
+class SeperateGateModule(nn.Module):
+    def __init__(self, latent_size, num_exps=[64, 64, 64, 64]):
+        super().__init__()
+        self.num_exps = num_exps
+        self.nets = nn.ModuleList()
+        for i in range(len(num_exps)):
+            self.nets.append(nn.Linear(latent_size, num_exps[i]))
+
+        # init output of each layer to be uniform
+        for i, net in enumerate(self.nets):
+            net.bias.data.fill_(1/num_exps[i])
+
+    def forward(self, latents):
+        # latents is N_imgs x N_layers x latent_size
+        gates = []
+        for i, net in enumerate(self.nets):
+            gate = net(latents[:, i]) # N_imgs x num_exps[i]
+            gates.append(gate) 
+
+        return torch.cat(gates, dim=1) # N_imgs x sum(num_exps)
+    
 
 class INRLoe(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=256, output_dim=3, 
                  num_hidden=4, image_resolution=32,
                  num_exps=[8, 16, 64, 256, 1024], 
                  ks = [4, 4, 32, 32, 256],
-                 latent_size=512, conditional=False,
+                 latent_size=512, gate_type='separate',
                  noisy_gating=False, noise_module=None,
                  merge_before_act=False, bias=False, patchwise=False):
         super(INRLoe, self).__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_hidden = num_hidden
-        self.net = nn.ModuleList()
+        self.net_param = []
+        self.net = []
         self.nl = Sine()
         self.num_exps = num_exps
         self.ks = ks
         self.noisy_gating = noisy_gating
         self.merge_before_act = merge_before_act
         self.bias = bias
-        self.conditional = conditional
+        self.gate_type = gate_type
         # self.top_k = top_k
 
         if self.noisy_gating and noise_module is not None:
             self.noise_generator = noise_module(output_size=sum(self.num_exps))
             self.softplus = nn.Softplus()
 
-        # self.map = PositionalEncoding(in_features=2,
-        #         num_frequencies=10,
-        #         sidelength=32,
-        #         use_nyquist=True
-        #     )
-        # input_dim = self.map.out_dim
-
-        self.net.append(
-            nn.Linear(input_dim, hidden_dim * self.num_exps[0])
-            )
+        # for param
+        self.net_param.append(nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * self.num_exps[0]), self.nl
+            ))
         for i in range(num_hidden-1):
-            self.net.append(
-                nn.Linear(hidden_dim, hidden_dim * self.num_exps[i+1])
-            )
-        self.net.append(nn.Linear(hidden_dim, output_dim * self.num_exps[-1]))
+            self.net_param.append(nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * self.num_exps[i+1]), self.nl
+            ))
+        self.net_param.append(nn.Linear(hidden_dim, output_dim * self.num_exps[-1]))
+        self.net_param = nn.Sequential(*self.net_param)
+        # self.net.apply(init_weights_relu)
+        self.net_param.apply(sine_init)
+        self.net_param[0].apply(first_layer_sine_init)
 
         # print net weight shape
-        for i, layer in enumerate(self.net):
-            print(f'Layer {i}: {layer.weight.shape}')
+        for name, weights_all in self.net_param.named_parameters():
+            print(f'{name}: {weights_all.shape}')
+
+        # for inference
+        self.net.append(MetaSequential(
+            BatchLinear(input_dim, hidden_dim), self.nl
+            ))
+        for i in range(num_hidden-1):
+            self.net.append(MetaSequential(
+                BatchLinear(hidden_dim, hidden_dim), self.nl
+            ))
+        self.net.append(BatchLinear(hidden_dim, output_dim))
+        self.net = MetaSequential(*self.net)
+        self.net.apply(sine_init)
+        self.net[0].apply(first_layer_sine_init)
+        for name, weights_all in self.net.named_parameters():
+            print(f'{name}: {weights_all.shape}')
+
+        # print net weight shape
+        # for i, layer in enumerate(self.net):
+        #     print(f'Layer {i}: {layer.weight.shape}')
 
         output_size = sum(self.num_exps) + hidden_dim * num_hidden + output_dim if self.bias \
             else sum(self.num_exps)
@@ -403,21 +441,17 @@ class INRLoe(nn.Module):
         #     self.gate_module = ResNet18ImgEncoder(output_size=output_size)
 
         # self.gate_module = 
-        if self.conditional:
+        if self.gate_type == 'conditional':
             self.gate_module = ConditionalGateModule(latent_size, num_exps=self.num_exps)
+        elif self.gate_type == 'separate':
+            self.gate_module = SeperateGateModule(latent_size, num_exps=self.num_exps)
         else:
             self.gate_module = nn.Linear(latent_size, output_size)
             for i, num_exp in enumerate(self.num_exps):
                 self.gate_module.bias.data[i*num_exp:(i+1)*num_exp].fill_(1/num_exp)
 
 
-        self.combiner = MoECombiner()
-
-        # self.net.apply(init_weights_relu)
-        self.net.apply(sine_init)
-
-        self.net[0].apply(first_layer_sine_init)
-
+        # self.combiner = MoECombiner()
         # for i, num_exp in enumerate(self.num_exps):
         #     self.gate_module.bias.data[i*num_exp:(i+1)*num_exp].fill_(1/num_exp)
         # zero init the weights
@@ -466,14 +500,37 @@ class INRLoe(nn.Module):
             gates[i] = zeros.scatter(1, top_k_indices, top_k_gates) # clear entries out of activated gates
 
         return gates #, bias, load
-        
+    
+    def get_combined_weight(self, gates):
+        # gates is a list of len(num_exps) x N_imgs x num_exps[i]
+        # return combined weight of shape N_imgs x (sum(num_exps))
+
+        params = dict()
+        for i, (name, weights_all) in enumerate(self.net_param.named_parameters()):
+            w_size = weights_all.size()
+            l = i // 2 # layer index
+            gate = gates[l] # N_imgs x N_exps
+            N_imgs, N_exps = gate.shape
+            weights_all = weights_all.view(N_exps, -1)
+            combined_weight = torch.matmul(gate, weights_all) # N_imgs x (hidden_dim * input_dim)
+            combined_weight = combined_weight.view(
+                [N_imgs, w_size[0]//N_exps] + list(w_size[1:])) # N_imgs x hidden_dim x input_dim
+            params[name] = combined_weight
+
+        return params
+
     def forward(self, latents, coords, top_k=False, softmax=False, 
                 noise_gates=[0, 0, 0, 0, 0], blend_alphas=[0, 0, 0, 0, 0]):
 
-        raw_gates, means, log_vars = self.gate_module(latents) # N_imgs x sum(num_exps)
-        mu_var = {'means': means, 'log_vars': log_vars}
-        N_imgs = raw_gates.shape[0] # if not patchwise: batchsize, else batchsize * num_patches_per_img
-        N_coords = coords.shape[0]
+        if self.gate_type == 'conditional':
+            raw_gates, means, log_vars = self.gate_module(latents) # N_imgs x sum(num_exps)
+            mu_var = {'means': means, 'log_vars': log_vars}
+        else:
+            raw_gates = self.gate_module(latents)
+            mu_var = None
+            
+        # N_imgs = raw_gates.shape[0] # if not patchwise: batchsize, else batchsize * num_patches_per_img
+        # N_coords = coords.shape[0]
 
         # split gates to according to self.num_exps
         if self.bias:
@@ -499,53 +556,157 @@ class INRLoe(nn.Module):
             # apply softmax to each gate
             temp = 1.0
             gates = [F.softmax(gate / temp, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
-        # else:
-        #     # l2 normalize each gate
-        #     gates = [F.normalize(gate, p=2, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
-        
+
         # blend the gates with uniform weights
         for i, alpha in enumerate(blend_alphas):
             gates[i] = alpha / self.num_exps[i] + (1 - alpha) * gates[i]
 
         importance = [torch.sum(gate, dim=0) for gate in gates] # len(num_exps) x num_exps[i]
+
+        params = self.get_combined_weight(gates) # dict of combined weights
         
-        # x = self.map(coords) # N_coords x in_dim
         x = coords
-        for i, (gate, layer) in enumerate(zip(gates, self.net)):
-            x = layer(x) # N_coords x (hidden_dim * num_exps[i]) for the first layer, 
-            # N_imgs x N_coords x (hidden_dim * num_exps[i]) for the rest 
-            if i < len(self.net) - 1 and not self.merge_before_act:
-                x = self.nl(x)
-            N_exp = self.num_exps[i]
-            if i == 0:
-                x = x.reshape(N_coords, -1, N_exp) # N_coords x hidden_dim x num_exps[i]
-                x = x.permute(2, 0, 1) # num_exps[i] x N_coords x hidden_dim
-                x = x.reshape(N_exp, -1) # num_exps[i] x (N_coords * hidden_dim)
-                # shape of gate is N_imgs x num_exps[i]
-                if top_k:
-                    x = self.combiner(x, gate) # N_imgs x (N_coords * hidden_dim)
-                else:
-                    x = torch.matmul(gate, x) # N_imgs x (N_coords * hidden_dim)
-            else:
-                x = x.reshape(N_imgs, N_coords, -1, N_exp) # N_imgs x N_coords x hidden_dim x num_exps[i]
-                x = x.permute(0, 3, 1, 2) # N_imgs x num_exps[i] x N_coords x hidden_dim
-                x = x.reshape(N_imgs, N_exp, -1) # N_imgs x num_exps[i] x (N_coords * hidden_dim)
-                if top_k:
-                    # x = self.combiner(x, gate) 
-                    x = torch.bmm(gate.unsqueeze(1), x).squeeze(1) # N_imgs x (N_coords * hidden_dim)
-                else:
-                    x = torch.bmm(gate.unsqueeze(1), x).squeeze(1) # N_imgs x (N_coords * hidden_dim)
-            x = x.reshape(N_imgs, N_coords, -1) # N_imgs x N_coords x hidden_dim
-            if self.bias:
-                x += bias[i].unsqueeze(1) # N_imgs x 1 x hidden_dim
-            # apply non-linearity except for the last layer
-            if i < len(self.net) - 1 and self.merge_before_act:
-                x = self.nl(x)
+        x = self.net(x, params=params)
+        # for i, (gate, layer) in enumerate(zip(gates, self.net)):
+        #     x = layer(x) # N_coords x (hidden_dim * num_exps[i]) for the first layer, 
+        #     # N_imgs x N_coords x (hidden_dim * num_exps[i]) for the rest 
+        #     if i < len(self.net) - 1 and not self.merge_before_act:
+        #         x = self.nl(x)
+        #     N_exp = self.num_exps[i]
+        #     if i == 0:
+        #         x = x.reshape(N_coords, -1, N_exp) # N_coords x hidden_dim x num_exps[i]
+        #         x = x.permute(2, 0, 1) # num_exps[i] x N_coords x hidden_dim
+        #         x = x.reshape(N_exp, -1) # num_exps[i] x (N_coords * hidden_dim)
+        #         # shape of gate is N_imgs x num_exps[i]
+        #         if top_k:
+        #             x = self.combiner(x, gate) # N_imgs x (N_coords * hidden_dim)
+        #         else:
+        #             x = torch.matmul(gate, x) # N_imgs x (N_coords * hidden_dim)
+        #     else:
+        #         x = x.reshape(N_imgs, N_coords, -1, N_exp) # N_imgs x N_coords x hidden_dim x num_exps[i]
+        #         x = x.permute(0, 3, 1, 2) # N_imgs x num_exps[i] x N_coords x hidden_dim
+        #         x = x.reshape(N_imgs, N_exp, -1) # N_imgs x num_exps[i] x (N_coords * hidden_dim)
+        #         if top_k:
+        #             # x = self.combiner(x, gate) 
+        #             x = torch.bmm(gate.unsqueeze(1), x).squeeze(1) # N_imgs x (N_coords * hidden_dim)
+        #         else:
+        #             x = torch.bmm(gate.unsqueeze(1), x).squeeze(1) # N_imgs x (N_coords * hidden_dim)
+        #     x = x.reshape(N_imgs, N_coords, -1) # N_imgs x N_coords x hidden_dim
+        #     if self.bias:
+        #         x += bias[i].unsqueeze(1) # N_imgs x 1 x hidden_dim
+        #     # apply non-linearity except for the last layer
+        #     if i < len(self.net) - 1 and self.merge_before_act:
+        #         x = self.nl(x)
         
         x = torch.sigmoid(x)
 
         return x, gates, importance, mu_var
+    
+    def get_parameters(self):
+        # return both the parameters of the network and the gate module
+        return list(self.net_param.parameters()) + list(self.gate_module.parameters())
+    
 
+class VAE(nn.Module):
+    def __init__(self, input_dim, latent_dim, hidden_dim):
+        super(VAE, self).__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) 
+        )
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_var = nn.Linear(hidden_dim, latent_dim)
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, input_dim),
+            # nn.Sigmoid()  # Use sigmoid if the data is normalized between 0 and 1
+        )
+    
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_var(h)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+    
+    def decode(self, z):
+        return self.decoder(z)
+    
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+    
+    
+class CVAE(nn.Module):
+    def __init__(self, input_dim, condition_dim, latent_dim, hidden_dim):
+        super(CVAE, self).__init__()
+        self.input_dim = input_dim
+        self.condition_dim = condition_dim
+        self.latent_dim = latent_dim
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim + condition_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_var = nn.Linear(hidden_dim, latent_dim)
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim + condition_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+            nn.Sigmoid()  # Use sigmoid if the data is normalized between 0 and 1
+        )
+    
+    def encode(self, x, c):
+        combined = torch.cat([x, c], dim=1)
+        h = self.encoder(combined)
+        return self.fc_mu(h), self.fc_var(h)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+    
+    def decode(self, z, c):
+        combined = torch.cat([z, c], dim=1)
+        return self.decoder(combined)
+    
+    def forward(self, x, c):
+        mu, logvar = self.encode(x, c)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z, c), mu, logvar
+    
 
 def init_weights_relu(m):
     if type(m) == nn.Linear:
