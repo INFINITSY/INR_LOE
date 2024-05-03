@@ -344,7 +344,7 @@ class ConditionalGateModule(nn.Module):
 
         return torch.cat(gates, dim=1), means, log_vars
         
-class SeperateGateModule(nn.Module):
+class SeparateGateModule(nn.Module):
     def __init__(self, latent_size, num_exps=[64, 64, 64, 64]):
         super().__init__()
         self.num_exps = num_exps
@@ -444,7 +444,7 @@ class INRLoe(nn.Module):
         if self.gate_type == 'conditional':
             self.gate_module = ConditionalGateModule(latent_size, num_exps=self.num_exps)
         elif self.gate_type == 'separate':
-            self.gate_module = SeperateGateModule(latent_size, num_exps=self.num_exps)
+            self.gate_module = SeparateGateModule(latent_size, num_exps=self.num_exps)
         else:
             self.gate_module = nn.Linear(latent_size, output_size)
             for i, num_exp in enumerate(self.num_exps):
@@ -608,14 +608,22 @@ class INRLoe(nn.Module):
     
 
 class VAE(nn.Module):
-    def __init__(self, input_dim, latent_dim, hidden_dim):
+    def __init__(self, input_dim, latent_dim, hidden_dim, condition_dim=None):
         super(VAE, self).__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
-        
+        self.condition_dim = condition_dim
+        self.condition = condition_dim is not None
+
         # Encoder
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim) if not self.condition else nn.Linear(input_dim + condition_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.LeakyReLU(0.1) ,
             nn.Linear(hidden_dim, hidden_dim),
@@ -630,7 +638,13 @@ class VAE(nn.Module):
         
         # Decoder
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(latent_dim, hidden_dim) if not self.condition else nn.Linear(latent_dim + condition_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.1) ,
+            nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.LeakyReLU(0.1) ,
             nn.Linear(hidden_dim, hidden_dim),
@@ -643,7 +657,9 @@ class VAE(nn.Module):
             # nn.Sigmoid()  # Use sigmoid if the data is normalized between 0 and 1
         )
     
-    def encode(self, x):
+    def encode(self, x, c=None):
+        if self.condition:
+            x = torch.cat([x, c], dim=1)
         h = self.encoder(x)
         return self.fc_mu(h), self.fc_var(h)
     
@@ -652,13 +668,15 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps*std
     
-    def decode(self, z):
+    def decode(self, z, c=None):
+        if self.condition:
+            z = torch.cat([z, c], dim=1)
         return self.decoder(z)
     
-    def forward(self, x):
-        mu, logvar = self.encode(x)
+    def forward(self, x, c=None):
+        mu, logvar = self.encode(x, c)
         z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+        return self.decode(z, c), mu, logvar
     
     
 class CVAE(nn.Module):

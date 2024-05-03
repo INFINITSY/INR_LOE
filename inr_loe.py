@@ -35,7 +35,7 @@ def compute_loss(out, y, criterion, gates=None, importance=None, top_k=False,
         std_loss = []
         cov_loss = []
         # gate is a list: num_layers x [N, num_experts]
-        std_threshold = [0.005, 0.01, 0.05, 0.1]
+        std_threshold = [0.005, 0.01, 0.05, 0.1, 0.15]
         for l, g in enumerate(gates):
             # compute the variance accross N samples
             std_loss.append(get_std_loss(g, threshold=std_threshold[l]))
@@ -120,7 +120,10 @@ def render_interp_condition(args, epoch, model, latents, blend_alphas, num_steps
     out = out.permute(0, 3, 1, 2)
     out = torch.clamp(out, 0, 1)
     grid_samples = torchvision.utils.make_grid(out, nrow=num_steps+1)
-    torchvision.utils.save_image(grid_samples, os.path.join(args.save, "interp_condition_train_e_{}.png".format(epoch)))
+    if not os.path.exists(os.path.join(args.save, "interp_condition")):
+        os.makedirs(os.path.join(args.save, "interp_condition"))
+    torchvision.utils.save_image(grid_samples, os.path.join(args.save, "interp_condition", 
+                                                            "interp_condition_train_e_{}.png".format(epoch)))
 
 
 def render_interp(args, epoch, model, latents, blend_alphas, num_steps=10):
@@ -146,7 +149,10 @@ def render_interp(args, epoch, model, latents, blend_alphas, num_steps=10):
     out = out.permute(0, 3, 1, 2)
     out = torch.clamp(out, 0, 1)
     grid_samples = torchvision.utils.make_grid(out, nrow=num_steps)
-    torchvision.utils.save_image(grid_samples, os.path.join(args.save, "interp_train_e_{}.png".format(epoch)))
+    if not os.path.exists(os.path.join(args.save, "interp")):
+        os.makedirs(os.path.join(args.save, "interp"))
+    torchvision.utils.save_image(grid_samples, os.path.join(args.save, "interp", 
+                                                            "interp_train_e_{}.png".format(epoch)))
 
 
 def render_sample(args, epoch, model, blend_alphas):
@@ -160,7 +166,10 @@ def render_sample(args, epoch, model, blend_alphas):
     out = out.permute(0, 3, 1, 2)
     out = torch.clamp(out, 0, 1)
     grid_samples = torchvision.utils.make_grid(out, nrow=4)
-    torchvision.utils.save_image(grid_samples, os.path.join(args.save, "sample_train_e_{}.png".format(epoch)))
+    if not os.path.exists(os.path.join(args.save, "sample")):
+        os.makedirs(os.path.join(args.save, "sample"))
+    torchvision.utils.save_image(grid_samples, os.path.join(args.save, "sample", 
+                                                            "sample_train_e_{}.png".format(epoch)))
 
 
 def render(args, epoch, model, render_loader, blend_alphas, test=False):
@@ -213,16 +222,23 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
         grid_samples = torchvision.utils.make_grid(out, nrow=int(math.sqrt(out.size(0))))
         if test:
             # plt.savefig(os.path.join(args.save, "output_test_e_{}.png".format(epoch)))
+            if not os.path.exists(os.path.join(args.save, "test")):
+                os.makedirs(os.path.join(args.save, "test"))
             torchvision.utils.save_image(grid_samples, 
-                                         os.path.join(args.save, "output_test_e_{}.png".format(epoch)))
+                                         os.path.join(args.save, "test", "output_test_e_{}.png".format(epoch)))
         else:
             # plt.savefig(os.path.join(args.save, "output_train_e_{}.png".format(epoch)))
+            if not os.path.exists(os.path.join(args.save, "train")):
+                os.makedirs(os.path.join(args.save, "train"))
             torchvision.utils.save_image(grid_samples, 
-                                         os.path.join(args.save, "output_train_e_{}.png".format(epoch)))
+                                         os.path.join(args.save, "train", "output_train_e_{}.png".format(epoch)))
 
             # render_interp(args, epoch, model, latents[:4], blend_alphas=blend_alphas, num_steps=10)
-            render_interp_condition(args, epoch, model, latents[:2], blend_alphas=blend_alphas, num_steps=10)
+            # render_interp_condition(args, epoch, model, latents[:2], blend_alphas=blend_alphas, num_steps=10)
             # render_sample(args, epoch, model, blend_alphas)
+
+            if not os.path.exists(os.path.join(args.save, "gates")):
+                os.makedirs(os.path.join(args.save, "gates"))
 
             gates = [gate.detach().cpu().numpy() for gate in gates]
             fig, axes = plt.subplots(1, len(gates), figsize=(16, 6))
@@ -239,10 +255,12 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
 
             plt.subplots_adjust(wspace=0.4)
             plt.tight_layout()
-            plt.savefig(os.path.join(args.save, "gates_train_e_{}.png".format(epoch)), 
+            plt.savefig(os.path.join(args.save, "gates", "gates_train_e_{}.png".format(epoch)), 
                         bbox_inches='tight', dpi=300)
             
             if mu_var is not None:
+                if not os.path.exists(os.path.join(args.save, "mu_var")):
+                    os.makedirs(os.path.join(args.save, "mu_var"))
                 means, log_vars = mu_var['means'], mu_var['log_vars']
                 means = [mean.detach().cpu().numpy() for mean in means]
                 log_vars = [log_var.detach().cpu().numpy() for log_var in log_vars]
@@ -263,7 +281,7 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
                     cbar.set_ticks([min_val, max_val])
                 plt.subplots_adjust(wspace=0.4)
                 plt.tight_layout()
-                plt.savefig(os.path.join(args.save, "mu_var_train_e_{}.png".format(epoch)), 
+                plt.savefig(os.path.join(args.save, "mu_var", "mu_var_train_e_{}.png".format(epoch)), 
                             bbox_inches='tight', dpi=300)
         # close the figure
         plt.close('all')
@@ -319,20 +337,20 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--root_dir', type=str, default='/home/s99tang/Research/loe_nvae/data/celeba')
-    parser.add_argument('--ckpt', type=str, default=None)
+    parser.add_argument('--ckpt', type=str, default='save/20240502_221525_separate_5_layer_b14_latent_64/ckpt/inr_loe_595.pt')
 
     # data loader
-    parser.add_argument('--train_subset', type=int, default=27000)
-    parser.add_argument('--render_subset', type=int, default=16)
+    parser.add_argument('--train_subset', type=int, default=30000)
+    parser.add_argument('--render_subset', type=int, default=9)
     parser.add_argument('--side_length', type=int, default=64)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=14)
     parser.add_argument('--patch_size', type=int, default=None)
 
     # train params
     parser.add_argument('--epochs', type=int, default=600)
     parser.add_argument('--epochs_render', type=int, default=5)
     parser.add_argument('--epochs_save', type=int, default=5)
-    parser.add_argument('--lr', type=float, default=0.0005, help='learning rate')
+    parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--min_lr', type=float, default=0, help='min learning rate')
     parser.add_argument('--lr_inner', type=float, default=1, help='learning rate for inner loop')
     parser.add_argument('--cv_loss', type=float, default=0, help='weight for cv loss')
@@ -346,12 +364,12 @@ if __name__ == '__main__':
     parser.add_argument('--softmax', action='store_true', help='whether to use softmax on gates')
     parser.add_argument('--bias', action='store_true', help='use bias on weighted experts')
     parser.add_argument('--merge_before_act', type=bool, default=True, help='merge experts before nl act')
-    parser.add_argument('--num_exps', nargs='+', type=int, default=[64, 64, 64, 64])
-    parser.add_argument('--ks', nargs='+', type=int, default=[8, 8, 8, 8])
+    parser.add_argument('--num_exps', nargs='+', type=int, default=[64, 64, 64, 64, 64])
+    parser.add_argument('--ks', nargs='+', type=int, default=[8, 8, 8, 8, 8])
     parser.add_argument('--progressive_epoch', type=int, default=None, help='progressively enable experts for each layer')
     parser.add_argument('--progressive_reverse', action='store_true', help='reverse the progressive enablement')
     parser.add_argument('--latent_size', type=int, default=256, help='size of the latent space')
-    parser.add_argument('--num_hidden', type=int, default=3, help='number of hidden layers')
+    parser.add_argument('--num_hidden', type=int, default=4, help='number of hidden layers')
     parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim')
     parser.add_argument('--std_latent', type=float, default=0.0001, help='std of latent sampling')
     parser.add_argument('--gate_type', type=str, default='separate', help='gating type: separate, conditional, or shared')
@@ -408,7 +426,7 @@ if __name__ == '__main__':
     testset = CelebADataset(root=args.root_dir, split='test', subset=args.render_subset,
                             downsampled_size=(args.side_length, args.side_length))
     
-    dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=(not args.compute_latents), num_workers=4)
     train_testloader = torch.utils.data.DataLoader(train_testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
@@ -429,7 +447,7 @@ if __name__ == '__main__':
 
     # blend gating with uniform gating: alpha * uniform + (1 - alpha) * gates
     blend_alphas = [0] * len(inr_loe.num_exps)
-    # blend_alphas = [1, 1, 1, 0]
+    # blend_alphas[-1] = 1 # disable the last layer gating
     meta_grad_init = [0 for _ in inr_loe.get_parameters()]
 
     # compute the latents for the dataset for stage 2
@@ -536,8 +554,11 @@ if __name__ == '__main__':
         logging.info("Epoch: {}, PSNR: {:.4f}".format(epoch, psnr_epoch))
 
         logging.info("Saving last model at epoch {}...".format(epoch))
-        torch.save(inr_loe.state_dict(), os.path.join(args.save, "inr_loe_last.pt"))
+        # save model to args.save/ckpt/
+        if not os.path.exists(os.path.join(args.save, "ckpt")):
+            os.makedirs(os.path.join(args.save, "ckpt"))
+        torch.save(inr_loe.state_dict(), os.path.join(args.save, "ckpt", "inr_loe_last.pt"))
         if epoch % args.epochs_save == 0:
             logging.info("Saving model...")
-            torch.save(inr_loe.state_dict(), os.path.join(args.save, "inr_loe_{}.pt".format(epoch)))
+            torch.save(inr_loe.state_dict(), os.path.join(args.save, "ckpt", "inr_loe_{}.pt".format(epoch)))
         

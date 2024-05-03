@@ -181,11 +181,15 @@ class CIFAR10Dataset(torch.utils.data.Dataset):
         return self.images[idx][0], torch.tensor(idx, dtype=torch.int64)
     
 class LatentsDataset(torch.utils.data.Dataset):
-    def __init__(self, latents_path, flat=True, subset=-1):
+    def __init__(self, latents_path, flat=False, subset=-1, layer=-1):
         super().__init__()
         self.latents = torch.load(latents_path)
         if flat:
             self.latents = self.latents.view(self.latents.shape[0], -1)
+        elif layer == 0:
+            self.latents = self.latents[:, 0]
+        elif layer > 0:
+            self.latents = self.latents[:, layer-1:layer+1]
         if subset > 0:
             self.latents = self.latents[:subset]
 
@@ -212,16 +216,5 @@ class LatentsDataset(torch.utils.data.Dataset):
     
 
 if __name__ == '__main__':
-    import matplotlib.pyplot as plt
-    import torch
-    import torchvision
-
-    dataset = CIFAR10Dataset(root='data', split='train')
-    print(dataset.num_images)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
-
-    for img, idx in dataloader:
-        print(img.shape)
-        plt.imshow(img[0].permute(1, 2, 0))
-        plt.show()
-        break
+    lt_path = 'INR_LOE/save/20240503_123320_compute_latents_5_layer_b14_latent_64_30000/latents_train_e_596.pt'
+    dataset = LatentsDataset(lt_path, flat=False, layer=4)
