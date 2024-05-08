@@ -428,7 +428,6 @@ if __name__ == '__main__':
                      num_hidden=args.num_hidden,
                      num_exps=args.num_exps,
                      ks=args.ks,
-                     image_resolution=args.side_length, 
                      latent_size=args.latent_size,
                      gate_type=args.gate_type,
                      ).cuda()
