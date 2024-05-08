@@ -368,12 +368,12 @@ class SeparateGateModule(nn.Module):
 
 class INRLoe(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=256, output_dim=3, 
-                 num_hidden=4, image_resolution=32,
+                 num_hidden=4,
                  num_exps=[8, 16, 64, 256, 1024], 
                  ks = [4, 4, 32, 32, 256],
-                 latent_size=512, gate_type='separate',
+                 latent_size=64, gate_type='separate',
                  noisy_gating=False, noise_module=None,
-                 merge_before_act=False, bias=False, patchwise=False):
+                 ):
         super(INRLoe, self).__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -384,10 +384,7 @@ class INRLoe(nn.Module):
         self.num_exps = num_exps
         self.ks = ks
         self.noisy_gating = noisy_gating
-        self.merge_before_act = merge_before_act
-        self.bias = bias
         self.gate_type = gate_type
-        # self.top_k = top_k
 
         if self.noisy_gating and noise_module is not None:
             self.noise_generator = noise_module(output_size=sum(self.num_exps))
@@ -426,36 +423,18 @@ class INRLoe(nn.Module):
         for name, weights_all in self.net.named_parameters():
             print(f'{name}: {weights_all.shape}')
 
-        # print net weight shape
-        # for i, layer in enumerate(self.net):
-        #     print(f'Layer {i}: {layer.weight.shape}')
+        output_size = sum(self.num_exps)
 
-        output_size = sum(self.num_exps) + hidden_dim * num_hidden + output_dim if self.bias \
-            else sum(self.num_exps)
-        # self.gate_module = ResDownConvImgEncoder(input_size=3, latent_size=512,
-        #                                          output_size=output_size, 
-        #                                          image_resolution=image_resolution)
-        # if patchwise:
-        #     self.gate_module = ResNet18NoMaxPoolImgEncoder(output_size=output_size)
-        # else:
-        #     self.gate_module = ResNet18ImgEncoder(output_size=output_size)
-
-        # self.gate_module = 
         if self.gate_type == 'conditional':
             self.gate_module = ConditionalGateModule(latent_size, num_exps=self.num_exps)
         elif self.gate_type == 'separate':
             self.gate_module = SeparateGateModule(latent_size, num_exps=self.num_exps)
-        else:
+        elif self.gate_type == 'shared':
             self.gate_module = nn.Linear(latent_size, output_size)
             for i, num_exp in enumerate(self.num_exps):
                 self.gate_module.bias.data[i*num_exp:(i+1)*num_exp].fill_(1/num_exp)
-
-
-        # self.combiner = MoECombiner()
-        # for i, num_exp in enumerate(self.num_exps):
-        #     self.gate_module.bias.data[i*num_exp:(i+1)*num_exp].fill_(1/num_exp)
-        # zero init the weights
-        # self.gate_module.weight.data.zero_()
+        else:
+            raise ValueError(f'Unsupported gate type: {self.gate_type}')
 
     def noisy_top_k_gating(self, x, raw_gates, noise_epsilon=1e-2):
         """Noisy top-k gating.
@@ -467,11 +446,6 @@ class INRLoe(nn.Module):
             gates: a Tensor with shape [batch_size, num_experts]
             load: a Tensor with shape [num_experts]
         """
-        # bias = 0.
-        # if self.bias:
-        #     clean_logits = raw_logits[:, :-self.output_size] # [bs, num_exps]
-        #     bias = raw_logits[:, -self.output_size:] # [bs, dim]
-        # else:
         clean_gates = raw_gates # len(num_exps) x N_imgs x num_exps[i]
 
         if self.noisy_gating and self.training:
@@ -519,8 +493,7 @@ class INRLoe(nn.Module):
 
         return params
 
-    def forward(self, latents, coords, top_k=False, softmax=False, 
-                noise_gates=[0, 0, 0, 0, 0], blend_alphas=[0, 0, 0, 0, 0]):
+    def forward(self, latents, coords, top_k=False, blend_alphas=[0, 0, 0, 0, 0]):
 
         if self.gate_type == 'conditional':
             raw_gates, means, log_vars = self.gate_module(latents) # N_imgs x sum(num_exps)
@@ -528,34 +501,15 @@ class INRLoe(nn.Module):
         else:
             raw_gates = self.gate_module(latents)
             mu_var = None
-            
-        # N_imgs = raw_gates.shape[0] # if not patchwise: batchsize, else batchsize * num_patches_per_img
-        # N_coords = coords.shape[0]
 
         # split gates to according to self.num_exps
-        if self.bias:
-            gates = raw_gates[:, :sum(self.num_exps)] # N_imgs x sum(num_exps)
-            gates = torch.split(gates, self.num_exps, dim=1) # len(num_exps) x N_imgs x num_exps[i]
-
-            bias = raw_gates[:, sum(self.num_exps):]
-            dims = [self.hidden_dim] * self.num_hidden + [self.output_dim]
-            bias = torch.split(bias, dims, dim=1) # len(num_exps) x N_imgs x hidden_dim[i]
-        else:
-            gates = torch.split(raw_gates, self.num_exps, dim=1) # len(num_exps) x N_imgs x num_exps[i]
+        gates = torch.split(raw_gates, self.num_exps, dim=1) # len(num_exps) x N_imgs x num_exps[i]
 
         # to list
         gates = list(gates)
-        # add noise to gates
-        if not self.training:
-            for gate, noise in zip(gates, noise_gates):
-                gate = gate + noise * torch.randn_like(gate)
         
         if top_k:
             gates = self.noisy_top_k_gating(latents, gates)
-        elif softmax:
-            # apply softmax to each gate
-            temp = 1.0
-            gates = [F.softmax(gate / temp, dim=1) for gate in gates] # len(num_exps) x N_imgs x num_exps[i]
 
         # blend the gates with uniform weights
         for i, alpha in enumerate(blend_alphas):
@@ -567,36 +521,6 @@ class INRLoe(nn.Module):
         
         x = coords
         x = self.net(x, params=params)
-        # for i, (gate, layer) in enumerate(zip(gates, self.net)):
-        #     x = layer(x) # N_coords x (hidden_dim * num_exps[i]) for the first layer, 
-        #     # N_imgs x N_coords x (hidden_dim * num_exps[i]) for the rest 
-        #     if i < len(self.net) - 1 and not self.merge_before_act:
-        #         x = self.nl(x)
-        #     N_exp = self.num_exps[i]
-        #     if i == 0:
-        #         x = x.reshape(N_coords, -1, N_exp) # N_coords x hidden_dim x num_exps[i]
-        #         x = x.permute(2, 0, 1) # num_exps[i] x N_coords x hidden_dim
-        #         x = x.reshape(N_exp, -1) # num_exps[i] x (N_coords * hidden_dim)
-        #         # shape of gate is N_imgs x num_exps[i]
-        #         if top_k:
-        #             x = self.combiner(x, gate) # N_imgs x (N_coords * hidden_dim)
-        #         else:
-        #             x = torch.matmul(gate, x) # N_imgs x (N_coords * hidden_dim)
-        #     else:
-        #         x = x.reshape(N_imgs, N_coords, -1, N_exp) # N_imgs x N_coords x hidden_dim x num_exps[i]
-        #         x = x.permute(0, 3, 1, 2) # N_imgs x num_exps[i] x N_coords x hidden_dim
-        #         x = x.reshape(N_imgs, N_exp, -1) # N_imgs x num_exps[i] x (N_coords * hidden_dim)
-        #         if top_k:
-        #             # x = self.combiner(x, gate) 
-        #             x = torch.bmm(gate.unsqueeze(1), x).squeeze(1) # N_imgs x (N_coords * hidden_dim)
-        #         else:
-        #             x = torch.bmm(gate.unsqueeze(1), x).squeeze(1) # N_imgs x (N_coords * hidden_dim)
-        #     x = x.reshape(N_imgs, N_coords, -1) # N_imgs x N_coords x hidden_dim
-        #     if self.bias:
-        #         x += bias[i].unsqueeze(1) # N_imgs x 1 x hidden_dim
-        #     # apply non-linearity except for the last layer
-        #     if i < len(self.net) - 1 and self.merge_before_act:
-        #         x = self.nl(x)
         
         x = torch.sigmoid(x)
 

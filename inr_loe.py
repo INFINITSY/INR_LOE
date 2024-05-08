@@ -19,32 +19,43 @@ import tqdm
 
 
 def compute_loss(out, y, criterion, gates=None, importance=None, top_k=False, 
-                 cv_loss_w=0.01, std_loss_w=0.01, cov_loss_w=0.01):
+                 cv_loss_w=0, std_loss_w=0, cov_loss_w=0):
+    '''
+    Compute the loss for the model
+    '''
     mse = criterion(out, y)
     if top_k: 
         loss = mse 
     else:
-        cv_loss = []
-        for l, v in enumerate(importance):
-            cv_loss.append(get_cv_loss(v))
-            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
-                # only calculate the cv loss for active layers
-                break
-        cv_loss = torch.stack(cv_loss).mean()
+        if importance is not None:
+            cv_loss = []
+            for l, v in enumerate(importance):
+                cv_loss.append(get_cv_loss(v))
+                if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                    # only calculate the cv loss for active layers
+                    break
+            cv_loss = torch.stack(cv_loss).mean()
+        else:
+            cv_loss = 0
         
-        std_loss = []
-        cov_loss = []
-        # gate is a list: num_layers x [N, num_experts]
-        std_threshold = [0.005, 0.01, 0.05, 0.1, 0.15]
-        for l, g in enumerate(gates):
-            # compute the variance accross N samples
-            std_loss.append(get_std_loss(g, threshold=std_threshold[l]))
-            cov_loss.append(get_cov_loss(g))
-            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
-                # only calculate the var loss for active layers
-                break
-        std_loss = torch.stack(std_loss).sum()
-        cov_loss = torch.stack(cov_loss).mean()
+        if gates is not None:
+            std_loss = []
+            cov_loss = []
+            # gates is a list: num_layers x [N, num_experts]
+            # std_threshold = [0.005, 0.01, 0.05, 0.1, 0.15]
+            std_threshold = [0.01] * len(gates)
+            for l, g in enumerate(gates):
+                # compute the variance accross N samples
+                std_loss.append(get_std_loss(g, threshold=std_threshold[l]))
+                cov_loss.append(get_cov_loss(g))
+                if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                    # only calculate the var loss for active layers
+                    break
+            std_loss = torch.stack(std_loss).sum()
+            cov_loss = torch.stack(cov_loss).mean()
+        else:
+            std_loss = 0
+            cov_loss = 0
         
         loss = mse + cv_loss_w * cv_loss + std_loss_w * std_loss + cov_loss_w * cov_loss
 
@@ -56,14 +67,16 @@ def off_diagonal(x):
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 def get_cov_loss(x):
-    # encourage the gate for each expert to be uncorrleated
+    '''
+    Encourage the off-diagonal elements of the covariance matrix to be small'''
     N, C = x.shape
     cov_x = (x.T @ x) / (N - 1)
     return off_diagonal(cov_x).pow_(2).sum().div(C)
 
 def get_std_loss(x, eps=1e-6, threshold=1e-1):
-    # x is a tensor of shape [N, C]
-    # compute the var accross N samples
+    '''
+    Encourage the std of the gate to be larger than a threshold
+    '''
     std_x = torch.sqrt(x.var(dim=0) + eps)
     return torch.mean(F.relu(threshold - std_x)) 
 
@@ -83,12 +96,16 @@ def get_cv_loss(x, eps=1e-10):
     return x.float().var() / (x.float().mean()**2 + eps)
 
 def entropy_regularization(output, beta=0.1):
-    # output: tensor of softmax outputs; shape: [N, C]
-    # beta: regularization coefficient
+    '''
+    Entropy regularization for the output
+    '''
     entropy = -torch.sum(output * torch.log(output + 1e-5), dim=1).mean()
     return beta * entropy
 
 def interpolate(latent1, latent2, num_steps, condition_layer=None):
+    '''
+    Interpolate between 2 latents
+    '''
     if condition_layer is None:
         return [(1 - alpha) * latent1 + alpha * latent2 for alpha in torch.linspace(0, 1, num_steps)]
     else:
@@ -102,8 +119,10 @@ def interpolate(latent1, latent2, num_steps, condition_layer=None):
         return latents
 
 def render_interp_condition(args, epoch, model, latents, blend_alphas, num_steps=10):
-    # latents is a list of 2 tensors of shape [N, layers, latent_size]
-    # first row, interp the first layer's latents, keep other layers the same
+    '''
+    Interpolate between 2 latents and render the images
+    Determine the layer to interpolate, keep the other layer fixed
+    '''
     num_layer = latents.shape[1]
     grid_latents = []
     for l in range(num_layer):
@@ -114,7 +133,7 @@ def render_interp_condition(args, epoch, model, latents, blend_alphas, num_steps
     model.eval()
     with torch.no_grad():
         coords = get_mgrid(args.side_length).cuda()
-        out, _, _, _ = model(grid_latents, coords, args.top_k, args.softmax,
+        out, _, _, _ = model(grid_latents, coords, args.top_k,
                           blend_alphas=blend_alphas)
     out = out.reshape(-1, args.side_length, args.side_length, 3)
     out = out.permute(0, 3, 1, 2)
@@ -127,8 +146,9 @@ def render_interp_condition(args, epoch, model, latents, blend_alphas, num_steps
 
 
 def render_interp(args, epoch, model, latents, blend_alphas, num_steps=10):
-    # latents is a list of 4 latents
-    # Horizontal interpolations (top and bottom)
+    '''
+    Interpolate between 4 latents and render the images
+    '''
     top_row = interpolate(latents[0], latents[1], num_steps)
     bottom_row = interpolate(latents[2], latents[3], num_steps)
 
@@ -138,11 +158,11 @@ def render_interp(args, epoch, model, latents, blend_alphas, num_steps=10):
         grid_latents.extend(interpolate(top, bottom, num_steps))
     grid_latents = torch.stack(grid_latents) # [N, latent_size]
 
-    # render the images
+    # Render the images
     model.eval()
     with torch.no_grad():
         coords = get_mgrid(args.side_length).cuda()
-        out, _, _, _ = model(grid_latents, coords, args.top_k, args.softmax,
+        out, _, _, _ = model(grid_latents, coords, args.top_k,
                           blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
 
     out = out.reshape(-1, args.side_length, args.side_length, 3)
@@ -156,11 +176,14 @@ def render_interp(args, epoch, model, latents, blend_alphas, num_steps=10):
 
 
 def render_sample(args, epoch, model, blend_alphas):
+    '''
+    Sample from the model and render the images
+    '''
     model.eval()
     with torch.no_grad():
         coords = get_mgrid(args.side_length).cuda()
         latents = torch.randn(16, args.latent_size).cuda() * args.std_latent
-        out, _, _, _ = model(latents, coords, args.top_k, args.softmax,
+        out, _, _, _ = model(latents, coords, args.top_k,
                           blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
     out = out.reshape(-1, args.side_length, args.side_length, 3)
     out = out.permute(0, 3, 1, 2)
@@ -173,6 +196,9 @@ def render_sample(args, epoch, model, blend_alphas):
 
 
 def render(args, epoch, model, render_loader, blend_alphas, test=False):
+    '''
+    Render the images, gates, and optionally the mu_var(for conditional gate) and interpolations
+    '''
     model.eval()
     coords = get_mgrid(args.side_length).cuda()
     for i, (img, idx) in enumerate(render_loader):
@@ -180,20 +206,22 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
         N, C, H, W = img.shape
         out_all = []
 
-        # reset the latents: random sample from N(0, 1)
+        # Zero-initialize the latents
         if args.gate_type in ['conditional', 'separate']:
             latents = torch.zeros(img.size(0), len(args.num_exps), args.latent_size).cuda() 
-        else:
+        elif args.gate_type == 'shared':
             latents = torch.zeros(img.size(0), args.latent_size).cuda()
+        else:
+            raise ValueError("Invalid gate type")
         latents.requires_grad = True
         lr_inner_render = args.lr_inner * N / args.batch_size
 
         y = img.reshape(N, C, -1)
         y = y.permute(0, 2, 1) # N_imgs x N_coords x 3
 
-        # inner loop for latents update
+        # Inner loop: latents update
         for _ in range(args.inner_steps):
-            out, gates, importance, _ = model(latents, coords, args.top_k, args.softmax,
+            out, gates, importance, _ = model(latents, coords, args.top_k,
                                             blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
             loss, _ = compute_loss(out, y, criterion, gates, importance, 
                                     args.top_k, args.cv_loss, args.std_loss)
@@ -203,43 +231,36 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
             latents = latents - lr_inner_render * latent_gradients
         
         with torch.no_grad():
-            out, gates, _, mu_var = model(latents, coords, args.top_k, args.softmax,
+            out, gates, _, mu_var = model(latents, coords, args.top_k,
                                     blend_alphas=blend_alphas)
         out_all.append(out)
-        
         out_all = torch.cat(out_all, 1)
-
-        if args.patch_size is not None:
-            n_patches = args.side_length // args.patch_size
-            out_all = out_all.reshape(N, n_patches, n_patches, args.patch_size, args.patch_size, C)
-            out_all = out_all.permute(0, 1, 3, 2, 4, 5) # [N, N_patches, P, N_patches, P, C]
-
         out = out_all.reshape(N, args.side_length, args.side_length, C)
         out = out.permute(0, 3, 1, 2)
-        # clip the output to [0, 1]
         out = torch.clamp(out, 0, 1)
-        # img = img.permute(0, 2, 3, 1)
         grid_samples = torchvision.utils.make_grid(out, nrow=int(math.sqrt(out.size(0))))
+
         if test:
-            # plt.savefig(os.path.join(args.save, "output_test_e_{}.png".format(epoch)))
+            # Save the test images
             if not os.path.exists(os.path.join(args.save, "test")):
                 os.makedirs(os.path.join(args.save, "test"))
             torchvision.utils.save_image(grid_samples, 
                                          os.path.join(args.save, "test", "output_test_e_{}.png".format(epoch)))
         else:
-            # plt.savefig(os.path.join(args.save, "output_train_e_{}.png".format(epoch)))
+            # Save the train images
             if not os.path.exists(os.path.join(args.save, "train")):
                 os.makedirs(os.path.join(args.save, "train"))
             torchvision.utils.save_image(grid_samples, 
                                          os.path.join(args.save, "train", "output_train_e_{}.png".format(epoch)))
 
+            # Uncomment to render the interpolation images
             # render_interp(args, epoch, model, latents[:4], blend_alphas=blend_alphas, num_steps=10)
             # render_interp_condition(args, epoch, model, latents[:2], blend_alphas=blend_alphas, num_steps=10)
             # render_sample(args, epoch, model, blend_alphas)
 
+            # Render the gates
             if not os.path.exists(os.path.join(args.save, "gates")):
                 os.makedirs(os.path.join(args.save, "gates"))
-
             gates = [gate.detach().cpu().numpy() for gate in gates]
             fig, axes = plt.subplots(1, len(gates), figsize=(16, 6))
             for j, gate in enumerate(gates):
@@ -258,6 +279,7 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
             plt.savefig(os.path.join(args.save, "gates", "gates_train_e_{}.png".format(epoch)), 
                         bbox_inches='tight', dpi=300)
             
+            # Render the mu_var for conditional gate
             if mu_var is not None:
                 if not os.path.exists(os.path.join(args.save, "mu_var")):
                     os.makedirs(os.path.join(args.save, "mu_var"))
@@ -287,7 +309,9 @@ def render(args, epoch, model, render_loader, blend_alphas, test=False):
         plt.close('all')
 
 def compute_latents(args, epoch, model, data_loader, blend_alphas):
-    # run inner loop to compute the latents for the dataset
+    '''
+    Run inner loops to compute the latents for the dataset
+    '''
     model.eval()
     coords = get_mgrid(args.side_length).cuda()
 
@@ -298,20 +322,22 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas):
         img = img.cuda()
         N, C, _, _ = img.shape
 
-        # reset the latents: random sample from N(0, 1)
+        # Zero-initialize the latents
         if args.gate_type in ['conditional', 'separate']:
             latents = torch.zeros(img.size(0), len(args.num_exps), args.latent_size).cuda() 
-        else:
+        elif args.gate_type == 'shared':
             latents = torch.zeros(img.size(0), args.latent_size).cuda()
+        else:
+            raise ValueError("Invalid gate type")
         latents.requires_grad = True
         lr_inner_render = args.lr_inner * N / args.batch_size
 
         y = img.reshape(N, C, -1)
         y = y.permute(0, 2, 1)
 
-        # inner loop for latents update
+        # Inner loop: latents update
         for _ in range(args.inner_steps):
-            out, gates, importance, _ = model(latents, coords, args.top_k, args.softmax,
+            out, gates, importance, _ = model(latents, coords, args.top_k,
                                             blend_alphas=blend_alphas)
             loss, _ = compute_loss(out, y, criterion, gates, importance,
                                    args.top_k, args.cv_loss, args.std_loss)
@@ -321,7 +347,7 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas):
             latents = latents - lr_inner_render * latent_gradients
 
         with torch.no_grad():
-            out, gates, importance, _ = model(latents, coords, args.top_k, args.softmax,
+            out, gates, importance, _ = model(latents, coords, args.top_k,
                                               blend_alphas=blend_alphas)
         _, mse = compute_loss(out, y, criterion, gates, importance, 
                               args.top_k, args.cv_loss, args.std_loss)
@@ -336,20 +362,20 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root_dir', type=str, default='/home/s99tang/Research/loe_nvae/data/celeba')
-    parser.add_argument('--ckpt', type=str, default='save/20240502_221525_separate_5_layer_b14_latent_64/ckpt/inr_loe_595.pt')
+    parser.add_argument('--root_dir', type=str, default='data/celeba64')
+    parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
     parser.add_argument('--train_subset', type=int, default=30000)
     parser.add_argument('--render_subset', type=int, default=9)
     parser.add_argument('--side_length', type=int, default=64)
     parser.add_argument('--batch_size', type=int, default=14)
-    parser.add_argument('--patch_size', type=int, default=None)
 
     # train params
     parser.add_argument('--epochs', type=int, default=600)
     parser.add_argument('--epochs_render', type=int, default=5)
     parser.add_argument('--epochs_save', type=int, default=5)
+    parser.add_argument('--steps_log', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--min_lr', type=float, default=0, help='min learning rate')
     parser.add_argument('--lr_inner', type=float, default=1, help='learning rate for inner loop')
@@ -361,23 +387,20 @@ if __name__ == '__main__':
 
     # model configs
     parser.add_argument('--top_k', action='store_true', help='whether to use top k sparce gates')
-    parser.add_argument('--softmax', action='store_true', help='whether to use softmax on gates')
-    parser.add_argument('--bias', action='store_true', help='use bias on weighted experts')
-    parser.add_argument('--merge_before_act', type=bool, default=True, help='merge experts before nl act')
     parser.add_argument('--num_exps', nargs='+', type=int, default=[64, 64, 64, 64, 64])
     parser.add_argument('--ks', nargs='+', type=int, default=[8, 8, 8, 8, 8])
     parser.add_argument('--progressive_epoch', type=int, default=None, help='progressively enable experts for each layer')
     parser.add_argument('--progressive_reverse', action='store_true', help='reverse the progressive enablement')
-    parser.add_argument('--latent_size', type=int, default=256, help='size of the latent space')
+    parser.add_argument('--latent_size', type=int, default=64, help='size of the latent for each layer')
     parser.add_argument('--num_hidden', type=int, default=4, help='number of hidden layers')
-    parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim of each expert')
     parser.add_argument('--std_latent', type=float, default=0.0001, help='std of latent sampling')
     parser.add_argument('--gate_type', type=str, default='separate', help='gating type: separate, conditional, or shared')
 
     parser.add_argument('--compute_latents', action='store_true', help='compute latents for stage 2')
     parser.add_argument('--wandb', action='store_true')
     parser.add_argument('--save', type=str, default='save')
-    parser.add_argument('--exp_cmt', type=str, default='compute_latents_30000')
+    parser.add_argument('--exp_cmt', type=str, default='DEFAULT')
 
     args = parser.parse_args()
 
@@ -392,7 +415,7 @@ if __name__ == '__main__':
     fh.setFormatter(logging.Formatter(log_format))
     logging.getLogger().addHandler(fh)
 
-    # log all input arguments
+    # Log the arguments
     for arg in vars(args):
         if arg != 'root_dir':
             logging.info(f"{arg}: {getattr(args, arg)}")
@@ -406,19 +429,15 @@ if __name__ == '__main__':
                      num_exps=args.num_exps,
                      ks=args.ks,
                      image_resolution=args.side_length, 
-                     merge_before_act=args.merge_before_act, 
-                     bias=args.bias,
-                     patchwise=(args.patch_size is not None),
                      latent_size=args.latent_size,
                      gate_type=args.gate_type,
                      ).cuda()
 
-    # count the number of parameters
+    # Count parameters
     params = sum(p.numel() for p in inr_loe.get_parameters())
     logging.info("Total number of parameters is: {}".format(params))
     logging.info("Model size is: {:.2f} MB".format(params * 4 / 1024**2)) 
 
-    # dataset = CIFAR10Dataset(root='data', class_label=5)
     trainset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
                             downsampled_size=(args.side_length, args.side_length))
     train_testset = CelebADataset(root=args.root_dir, split='train', subset=args.render_subset,
@@ -426,11 +445,10 @@ if __name__ == '__main__':
     testset = CelebADataset(root=args.root_dir, split='test', subset=args.render_subset,
                             downsampled_size=(args.side_length, args.side_length))
     
+    # When computing the latents, we don't need to shuffle the data
     dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=(not args.compute_latents), num_workers=4)
     train_testloader = torch.utils.data.DataLoader(train_testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
-    # img_size = args.side_length if args.patch_size is None else args.patch_size
 
     optim_net = torch.optim.Adam(inr_loe.get_parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim_net, T_max=args.epochs, eta_min=args.min_lr)
@@ -450,13 +468,14 @@ if __name__ == '__main__':
     # blend_alphas[-1] = 1 # disable the last layer gating
     meta_grad_init = [0 for _ in inr_loe.get_parameters()]
 
-    # compute the latents for the dataset for stage 2
+    # Compute the latents for the dataset for stage 2
     if args.compute_latents:
         logging.info("Computing latents for the dataset...")
         compute_latents(args, start_epoch, inr_loe, dataloader, blend_alphas)
         # exit the program after computing the latents
         sys.exit()
     
+    # Training epochs
     for epoch in range(start_epoch, args.epochs):
         inr_loe.train()
         coords = get_mgrid(args.side_length).cuda()
@@ -472,57 +491,44 @@ if __name__ == '__main__':
                     blend_alphas[l] = alpha
 
         psnr_epoch = 0
-        # iterate over the images
+        # Outer loop: iterate over the images. 
         for i, (img, idx) in enumerate(dataloader):
             img = img.cuda() # N_imgs x 3 x 64 x 64
             idx = idx.cuda() # N_imgs
-            # N_imgs = img.shape[0]
-            if args.patch_size is not None:
-                img_perm = img.permute(0, 2, 3, 1) # N_imgs x 64 x 64 x 3
-                n_patches = args.side_length // args.patch_size
-                img_reshaped = img_perm.reshape(img_perm.size(0), n_patches, args.patch_size, 
-                                                n_patches, args.patch_size, img_perm.size(-1))
-                img_transposed = img_reshaped.permute(0, 1, 3, 2, 4, 5)
-                img_patch = img_transposed.reshape(-1, args.patch_size, args.patch_size, img_perm.size(-1))
-                # img_patch: [N_imgs x N_patches x N_patches] x 16 x 16 x 3
-                img_gt = img_patch.permute(0, 3, 1, 2)
-            else:
-                img_gt = img
 
             if args.gate_type in ['conditional', 'separate']:
                 latents = torch.randn(img.size(0), len(args.num_exps), args.latent_size).cuda() * args.std_latent
-            else:
-                # shared latent
+            elif args.gate_type == 'shared':
                 latents = torch.randn(img.size(0), args.latent_size).cuda() * args.std_latent
+            else:
+                raise ValueError("Invalid gate type")
             latents.requires_grad = True
 
-            # initialise meta-gradient
+            # Initialise meta-gradient
             meta_grad = copy.deepcopy(meta_grad_init)
 
-            N, C, H, W = img_gt.shape
-            y = img_gt.reshape(N, C, -1)
+            N, C, H, W = img.shape
+            y = img.reshape(N, C, -1)
             y = y.permute(0, 2, 1) # N_imgs x N_coords x 3
 
-            # inner loop for latents update
+            # Inner loop: latents update
             for _ in range(args.inner_steps):
-                out, gates, importance, _ = inr_loe(latents, coords, args.top_k, args.softmax, 
+                out, gates, importance, _ = inr_loe(latents, coords, args.top_k, 
                                                 blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
-
                 loss, _ = compute_loss(out, y, criterion, gates, importance, 
                                         args.top_k, args.cv_loss, args.std_loss)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
                 latents = latents - args.lr_inner * latent_gradients
 
-            # update the shared weights
-            out, gates, importance, _ = inr_loe(latents, coords, args.top_k, args.softmax, 
+            # Update the shared weights
+            out, gates, importance, _ = inr_loe(latents, coords, args.top_k, 
                                             blend_alphas=blend_alphas)
-            
             loss, mse = compute_loss(out, y, criterion, gates, importance, 
                                         args.top_k, args.cv_loss, args.std_loss)
             task_grad = torch.autograd.grad(loss, inr_loe.get_parameters())
 
-            # add to meta-gradient
+            # Add to meta-gradient
             for g in range(len(task_grad)):
                 meta_grad[g] += task_grad[g].detach()
 
@@ -533,28 +539,28 @@ if __name__ == '__main__':
             nn.utils.clip_grad_norm_(inr_loe.get_parameters(), max_norm=args.grad_clip)
             optim_net.step()
             
-            # compute psnr
+            # Compute the PSNR
             mse = mse.item()
             psnr = 10 * np.log10(1 / mse) # shape is N_imgs
 
             psnr_epoch += psnr.mean()
 
-            if i % 25 == 0:
+            if i % args.steps_log == 0:
                 logging.info("Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}".format(
                     epoch, i, loss.item(), psnr.mean()))
                 if args.wandb:
                     wandb.log({"loss": loss.item(), "psnr": psnr.mean()})
         scheduler.step()
 
+        # Render the images
         if epoch % args.epochs_render == 0:
             render(args, epoch, inr_loe, train_testloader, blend_alphas)
             render(args, epoch, inr_loe, testloader, blend_alphas, test=True)
 
+        # Loggings and saving the model
         psnr_epoch /= len(dataloader)
         logging.info("Epoch: {}, PSNR: {:.4f}".format(epoch, psnr_epoch))
-
         logging.info("Saving last model at epoch {}...".format(epoch))
-        # save model to args.save/ckpt/
         if not os.path.exists(os.path.join(args.save, "ckpt")):
             os.makedirs(os.path.join(args.save, "ckpt"))
         torch.save(inr_loe.state_dict(), os.path.join(args.save, "ckpt", "inr_loe_last.pt"))
