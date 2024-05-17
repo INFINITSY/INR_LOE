@@ -137,7 +137,13 @@ class CelebADataset(torch.utils.data.Dataset):
         # permute to CHW
         img = np.transpose(img, (2, 0, 1))
 
-        return torch.from_numpy(img), torch.tensor(idx, dtype=torch.int64)
+        in_dict = {
+            'idx': torch.tensor(idx, dtype=torch.int64), 
+            'coords': get_mgrid(self.downsampled_size[0]) 
+            }
+        gt_dict = {'img': torch.from_numpy(img)}
+
+        return in_dict, gt_dict
     
 
 class CIFAR10Dataset(torch.utils.data.Dataset):
@@ -213,7 +219,62 @@ class LatentsDataset(torch.utils.data.Dataset):
         latent = (latent - self.mean) / self.std
 
         return latent, torch.tensor(idx, dtype=torch.int64)
+
+
+class ShapeNet(torch.utils.data.Dataset):
+    def __init__(self, split='train', sampling=None, root='datasets', 
+                 simple_output=False, random_scale=False, subset=-1):
+        self.dataset_root = root
+        self.sampling = sampling
+        self.init_model_bool = False
+        self.split = split
+        self.simple_output = simple_output
+        self.random_scale = random_scale
+        self.subset = subset
+        self.init_model()
+        self.data_type = 'voxel'
+
+    def __len__(self):
+        # if self.split == "train":
+        #     return 35019
+        # else:
+        #     return 8762
+        return len(self.data_points_int)
     
+    def init_model(self):
+        split = self.split
+        points_path = os.path.join(self.dataset_root, 'shapenet', 'all_vox256_img', 'data_points_int_' + split + '.pth')
+        values_path = os.path.join(self.dataset_root, 'shapenet', 'all_vox256_img', 'data_values_' + split + '.pth')
+
+        self.data_points_int = torch.load(points_path).byte()
+        self.data_values = torch.load(values_path).byte()
+
+        if self.subset > 0:
+            self.data_points_int = self.data_points_int[:self.subset]
+            self.data_values = self.data_values[:self.subset]
+
+    def __getitem__(self, idx):
+        points = (self.data_points_int[idx].float() + 1) / 128 - 1
+        # occs = self.data_values[idx].float() * 2 -1
+        occs = self.data_values[idx].float()
+
+        if self.sampling is not None:
+            idcs = np.random.randint(0, len(points), size=self.sampling)
+            points = points[idcs]
+            occs = occs[idcs]
+
+        if self.random_scale:
+            points = np.random.uniform(0.75, 1.25) * points
+
+        if self.simple_output:
+            return occs
+
+        else:
+            in_dict = {'idx': idx, 'coords': points}
+            gt_dict = {'img': occs}
+
+            return in_dict, gt_dict
+        
 
 if __name__ == '__main__':
     lt_path = 'INR_LOE/save/20240503_123320_compute_latents_5_layer_b14_latent_64_30000/latents_train_e_596.pt'
