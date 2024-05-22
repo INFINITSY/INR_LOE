@@ -251,6 +251,7 @@ if __name__ == '__main__':
         # Loggings and saving the model
         psnr_epoch /= len(dataloader)
         acc_epoch /= len(dataloader)
+        rec_epoch /= len(dataloader)
         logging.info("Epoch: {}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
             epoch, psnr_epoch, acc_epoch, rec_epoch))
         logging.info("Saving last model at epoch {}...".format(epoch))

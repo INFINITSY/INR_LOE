@@ -385,5 +385,6 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion):
         latents_all.append(latents)
     latents_all = torch.cat(latents_all, 0)
     torch.save(latents_all, os.path.join(args.save, "latents_train_e_{}.pt".format(epoch)))
-    logging.info("Average PSNR: {:.4f}, Acc: {:.4f}".format(psnr / len(data_loader),
-                                                            acc / len(data_loader)))
+    logging.info("Average PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(psnr / len(data_loader),
+                                                                            acc / len(data_loader),
+                                                                            rec / len(data_loader)))
