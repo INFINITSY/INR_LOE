@@ -149,7 +149,7 @@ if __name__ == '__main__':
     # compute the latents for the dataset for stage 2
     if args.compute_latents:
         logging.info("Computing latents for the dataset...")
-        compute_latents(args, start_epoch, inr_loe, dataloader, blend_alphas)
+        compute_latents(args, start_epoch, inr_loe, dataloader, blend_alphas, criterion)
         # exit the program after computing the latents
         sys.exit()
     
