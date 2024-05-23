@@ -10,14 +10,14 @@ import numpy as np
 import argparse
 import wandb
 from datasets import CelebADataset, ShapeNet
-from model import INRLoe
+from stage1.model import INRLoe
 from sklearn.metrics import precision_score, recall_score
-from utils import compute_loss, compute_latents, render
+from stage1.utils import compute_loss, compute_latents, render
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root_dir', type=str, default='INR_LOE/data')
+    parser.add_argument('--root_dir', type=str, default='/mnt/Data')
     parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
@@ -88,6 +88,11 @@ if __name__ == '__main__':
         wandb.init(project="inr-loe")
         wandb.config.update(args)
 
+    # load all the datasets when computing latents
+    if args.compute_latents:
+        args.train_subset = -1
+        args.render_subset = -1
+
     if args.dataset == 'celeba':
         input_dim, output_dim = 2, 3
         trainset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
@@ -148,8 +153,10 @@ if __name__ == '__main__':
 
     # compute the latents for the dataset for stage 2
     if args.compute_latents:
-        logging.info("Computing latents for the dataset...")
+        logging.info("Computing latents for the train set...")
         compute_latents(args, start_epoch, inr_loe, dataloader, blend_alphas, criterion)
+        logging.info("Computing latents for the test set...")
+        compute_latents(args, start_epoch, inr_loe, testloader, blend_alphas, criterion, test=True)
         # exit the program after computing the latents
         sys.exit()
     

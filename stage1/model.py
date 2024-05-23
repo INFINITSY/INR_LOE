@@ -5,8 +5,7 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 import torch_geometric
-from datasets import CIFAR10Dataset, LatticeDataset
-from meta import MetaModule, MetaSequential, BatchLinear
+from .meta import MetaModule, MetaSequential, BatchLinear
 
 ### Taken from official SIREN repo
 class Sine(nn.Module):

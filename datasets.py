@@ -17,31 +17,21 @@ def get_mgrid(sidelen, dim=2, max=1.0):
     return mgrid
 
 
-class LatticeDataset(torch.utils.data.Dataset):
+def get_mgrid_voxel(sidelen):
+    '''Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.'''
+    dim = 3
+    if isinstance(sidelen, int):
+        sidelen = dim * (sidelen,)
 
-    def __init__(self, image_shape=(32, 32)):
-        super().__init__()
+    pixel_coords = np.stack(np.mgrid[:sidelen[0], :sidelen[1], :sidelen[2]], axis=-1)[None, ...].astype(np.float32)
+    pixel_coords[..., 0] = (pixel_coords[..., 0] + 1) / max(sidelen[0], 1)
+    pixel_coords[..., 1] = (pixel_coords[..., 1] + 1) / sidelen[1]
+    pixel_coords[..., 2] = (pixel_coords[..., 2] + 1) / sidelen[2]
 
-        self.mgrid = self.get_2d_mgrid(image_shape)
-
-    def get_2d_mgrid(self, shape):
-        pixel_coords = np.stack(np.mgrid[:shape[0], :shape[1]], axis=-1).astype(np.float32)
-
-        # normalize pixel coords onto [-1, 1]
-        pixel_coords[..., 0] = pixel_coords[..., 0] / max(shape[0] - 1, 1)
-        pixel_coords[..., 1] = pixel_coords[..., 1] / max(shape[1] - 1, 1)
-        pixel_coords -= 0.5
-        pixel_coords *= 2.
-        # flatten 
-        pixel_coords = torch.tensor(pixel_coords).view(-1, 2)
-
-        return pixel_coords
-
-    def __len__(self):
-        return self.mgrid.shape[0]
-    
-    def __getitem__(self, idx):
-        return self.mgrid[idx], torch.tensor(idx, dtype=torch.int64)
+    pixel_coords -= 0.5
+    pixel_coords *= 2.
+    pixel_coords = torch.Tensor(pixel_coords).view(-1, dim)
+    return pixel_coords
     
 
 class TransposeTransform:
@@ -187,8 +177,14 @@ class CIFAR10Dataset(torch.utils.data.Dataset):
         return self.images[idx][0], torch.tensor(idx, dtype=torch.int64)
     
 class LatentsDataset(torch.utils.data.Dataset):
-    def __init__(self, latents_path, flat=False, subset=-1, layer=-1):
+    def __init__(self, root, split='train', flat=False, subset=-1, layer=-1):
         super().__init__()
+        if split == 'train':
+            latents_path = os.path.join(root, 'latents_train.pt')
+        elif split == 'test':
+            latents_path = os.path.join(root, 'latents_test.pt')
+        else:
+            raise ValueError('Invalid split')
         self.latents = torch.load(latents_path)
         if flat:
             self.latents = self.latents.view(self.latents.shape[0], -1)

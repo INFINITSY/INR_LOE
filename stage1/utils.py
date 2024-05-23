@@ -9,7 +9,16 @@ import matplotlib.pyplot as plt
 import logging
 
 from sklearn.metrics import recall_score
-from datasets import get_mgrid
+
+
+def get_mgrid(sidelen, dim=2, max=1.0):
+    '''Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
+    sidelen: int
+    dim: int'''
+    tensors = tuple(dim * [torch.linspace(-max, max, steps=sidelen)])
+    mgrid = torch.stack(torch.meshgrid(*tensors), dim=-1)
+    mgrid = mgrid.reshape(-1, dim)
+    return mgrid
 
 
 def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False, 
@@ -329,7 +338,7 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     # close the figure
     plt.close('all')
 
-def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion):
+def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, test=False):
     # run inner loop to compute the latents for the dataset
     model.eval()
 
@@ -384,7 +393,8 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion):
 
         latents_all.append(latents)
     latents_all = torch.cat(latents_all, 0)
-    torch.save(latents_all, os.path.join(args.save, "latents_train_e_{}.pt".format(epoch)))
+    split = 'test' if test else 'train'
+    torch.save(latents_all, os.path.join(args.save, f"latents_{split}_e_{epoch}.pt"))
     logging.info("Average PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(psnr / len(data_loader),
                                                                             acc / len(data_loader),
                                                                             rec / len(data_loader)))
