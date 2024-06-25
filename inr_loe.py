@@ -1,18 +1,20 @@
+import argparse
+import copy
+import logging
+import math
 import os
 import sys
 import time
-import copy
-import math
-import logging
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import argparse
+from sklearn.metrics import precision_score, recall_score
+
 import wandb
 from datasets import CelebADataset, ShapeNet
 from stage1.model import INRLoe
-from sklearn.metrics import precision_score, recall_score
-from stage1.utils import compute_loss, compute_latents, render
+from stage1.utils import compute_latents, compute_loss, render
 
 if __name__ == '__main__':
 
@@ -21,7 +23,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
-    parser.add_argument('--dataset', type=str, default='shapenet', help='dataset name')
+    parser.add_argument('--dataset', type=str, default='celeba', help='dataset name')
     parser.add_argument('--batch_size', type=int, default=14)
     parser.add_argument('--train_subset', type=int, default=-1)
     parser.add_argument('--render_subset', type=int, default=9)
@@ -111,26 +113,27 @@ if __name__ == '__main__':
                             random_scale=args.random_scale, subset=args.render_subset)
     else:
         raise ValueError("Invalid dataset")
-    
+
     dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=(not args.compute_latents), num_workers=4)
     train_testloader = torch.utils.data.DataLoader(train_testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # create the model
-    inr_loe = INRLoe(input_dim=input_dim,
-                     output_dim=output_dim,
-                     hidden_dim=args.hidden_dim,
-                     num_hidden=args.num_hidden,
-                     num_exps=args.num_exps,
-                     ks=args.ks,
-                     latent_size=args.latent_size,
-                     gate_type=args.gate_type,
-                     ).cuda()
+    inr_loe = INRLoe(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        hidden_dim=args.hidden_dim,
+        num_hidden=args.num_hidden,
+        num_exps=args.num_exps,
+        ks=args.ks,
+        latent_size=args.latent_size,
+        gate_type=args.gate_type,
+    ).cuda()
 
     # count the number of parameters
     params = sum(p.numel() for p in inr_loe.get_parameters())
     logging.info("Total number of parameters is: {}".format(params))
-    logging.info("Model size is: {:.2f} MB".format(params * 4 / 1024**2)) 
+    logging.info("Model size is: {:.2f} MB".format(params * 4 / 1024**2))
 
     # create the optimizer and scheduler
     optim_net = torch.optim.Adam(inr_loe.get_parameters(), lr=args.lr, weight_decay=1e-5)
@@ -139,7 +142,7 @@ if __name__ == '__main__':
 
     # load the model if checkpoint is provided
     if args.ckpt is not None:
-        inr_loe.load_state_dict(torch.load(args.ckpt)) 
+        inr_loe.load_state_dict(torch.load(args.ckpt))
         start_epoch = int(args.ckpt.split('_')[-1].split('.')[0]) + 1
         logging.info("Model loaded from {}".format(args.ckpt))
         logging.info("Starting from epoch {}".format(start_epoch))
@@ -159,7 +162,7 @@ if __name__ == '__main__':
         compute_latents(args, start_epoch, inr_loe, testloader, blend_alphas, criterion, test=True)
         # exit the program after computing the latents
         sys.exit()
-    
+
     for epoch in range(start_epoch, args.epochs):
         inr_loe.train()
 
@@ -168,8 +171,8 @@ if __name__ == '__main__':
             for l in range(1, len(blend_alphas)):
                 # sigmoid function to gradually change the alpha
                 alpha = 1 - 1 / (1 + math.exp((l * args.progressive_epoch - epoch) / 2))
-                if args.progressive_reverse: 
-                    blend_alphas[-l-1] = alpha
+                if args.progressive_reverse:
+                    blend_alphas[-l - 1] = alpha
                 else:
                     blend_alphas[l] = alpha
 
@@ -177,7 +180,7 @@ if __name__ == '__main__':
         # for voxel
         acc_epoch = 0
         rec_epoch = 0
-        # Outer loop: iterate over the images. 
+        # Outer loop: iterate over the images.
         for i, (in_dict, gt_dict) in enumerate(dataloader):
             img = gt_dict['img'].cuda()
             idx = in_dict['idx'].cuda()
@@ -197,7 +200,7 @@ if __name__ == '__main__':
             if args.dataset == 'celeba':
                 N, C, H, W = img.shape
                 y = img.reshape(N, C, -1)
-                y = y.permute(0, 2, 1) # N_imgs x N_coords x 3
+                y = y.permute(0, 2, 1)  # N_imgs x N_coords x 3
             elif args.dataset == 'shapenet':
                 y = img
 
@@ -205,8 +208,8 @@ if __name__ == '__main__':
             for _ in range(args.inner_steps):
                 out, gates, importance, _ = inr_loe(latents, coords, args.top_k,
                                                 blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
-                loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, 
-                                        args.top_k, args.cv_loss, args.std_loss)
+                loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance,
+                                       args.top_k, args.cv_loss, args.std_loss)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
                 latents = latents - args.lr_inner * latent_gradients
@@ -214,8 +217,8 @@ if __name__ == '__main__':
             # Update the shared weights
             out, gates, importance, _ = inr_loe(latents, coords, args.top_k,
                                             blend_alphas=blend_alphas)
-            loss, mse = compute_loss(args, epoch, out, y, criterion, gates, importance, 
-                                        args.top_k, args.cv_loss, args.std_loss)
+            loss, mse = compute_loss(args, epoch, out, y, criterion, gates, importance,
+                                     args.top_k, args.cv_loss, args.std_loss)
             task_grad = torch.autograd.grad(loss, inr_loe.get_parameters())
 
             # Add to meta-gradient
@@ -228,9 +231,9 @@ if __name__ == '__main__':
 
             nn.utils.clip_grad_norm_(inr_loe.get_parameters(), max_norm=args.grad_clip)
             optim_net.step()
-            
+
             # compute psnr
-            psnr = 10 * np.log10(1 / mse.item()) # shape is N_imgs
+            psnr = 10 * np.log10(1 / mse.item())  # shape is N_imgs
             psnr_epoch += psnr
 
             # compute acc for voxel
@@ -238,14 +241,17 @@ if __name__ == '__main__':
             rec = 0
             if args.dataset == 'shapenet':
                 pred = (out >= 0.5).float()
-                acc = pred.eq(y).float().mean() 
+                acc = pred.eq(y).float().mean()
                 acc_epoch += acc
                 rec = recall_score(y.cpu().numpy().flatten(), pred.cpu().numpy().flatten())
                 rec_epoch += rec
 
             if i % 25 == 0:
-                logging.info("Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
-                    epoch, i, loss.item(), psnr, acc, rec))
+                logging.info(
+                    "Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
+                        epoch, i, loss.item(), psnr, acc, rec
+                    )
+                )
                 if args.wandb:
                     wandb.log({"loss": loss.item(), "psnr": psnr, "acc": acc, "rec": rec})
         scheduler.step()
@@ -259,8 +265,9 @@ if __name__ == '__main__':
         psnr_epoch /= len(dataloader)
         acc_epoch /= len(dataloader)
         rec_epoch /= len(dataloader)
-        logging.info("Epoch: {}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
-            epoch, psnr_epoch, acc_epoch, rec_epoch))
+        logging.info(
+            "Epoch: {}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(epoch, psnr_epoch, acc_epoch, rec_epoch)
+        )
         logging.info("Saving last model at epoch {}...".format(epoch))
         if not os.path.exists(os.path.join(args.save, "ckpt")):
             os.makedirs(os.path.join(args.save, "ckpt"))

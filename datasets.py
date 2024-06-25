@@ -1,16 +1,17 @@
+import csv
 import os
+
+import numpy as np
 import torch
 import torchvision
-import numpy as np
-import csv
 from PIL import Image
-from torchvision.transforms import Resize, Compose, ToTensor, Normalize
+from torchvision.transforms import Compose, Normalize, Resize, ToTensor
 
 
 def get_mgrid(sidelen, dim=2, max=1.0):
-    '''Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
+    """Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
     sidelen: int
-    dim: int'''
+    dim: int"""
     tensors = tuple(dim * [torch.linspace(-max, max, steps=sidelen)])
     mgrid = torch.stack(torch.meshgrid(*tensors), dim=-1)
     mgrid = mgrid.reshape(-1, dim)
@@ -18,25 +19,25 @@ def get_mgrid(sidelen, dim=2, max=1.0):
 
 
 def get_mgrid_voxel(sidelen):
-    '''Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.'''
+    """Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1."""
     dim = 3
     if isinstance(sidelen, int):
         sidelen = dim * (sidelen,)
 
-    pixel_coords = np.stack(np.mgrid[:sidelen[0], :sidelen[1], :sidelen[2]], axis=-1)[None, ...].astype(np.float32)
+    pixel_coords = np.stack(np.mgrid[: sidelen[0], : sidelen[1], : sidelen[2]], axis=-1)[None, ...].astype(np.float32)
     pixel_coords[..., 0] = (pixel_coords[..., 0] + 1) / max(sidelen[0], 1)
     pixel_coords[..., 1] = (pixel_coords[..., 1] + 1) / sidelen[1]
     pixel_coords[..., 2] = (pixel_coords[..., 2] + 1) / sidelen[2]
 
     pixel_coords -= 0.5
-    pixel_coords *= 2.
+    pixel_coords *= 2.0
     pixel_coords = torch.Tensor(pixel_coords).view(-1, dim)
     return pixel_coords
-    
+
 
 class TransposeTransform:
 
-    def __init__(self, in_fmt='CHW', out_fmt='HWC'):
+    def __init__(self, in_fmt="CHW", out_fmt="HWC"):
         self.order = [in_fmt.index(c) for c in out_fmt]
 
     def __call__(self, img):
@@ -57,11 +58,11 @@ class CelebADataset(torch.utils.data.Dataset):
             rowreader = csv.reader(csvfile, delimiter=' ', quotechar='|')
             for row in rowreader:
                 # if split == 'train' and row[1] == '0':
-                if split == 'train' and row[1] == '0':
+                if split == "train" and row[1] == "0":
                     self.file_names.append(row[0])
-                elif split == 'val' and row[1] == '1':
+                elif split == "val" and row[1] == "1":
                     self.file_names.append(row[0])
-                elif split == 'test' and row[1] == '2':
+                elif split == "test" and row[1] == "2":
                     self.file_names.append(row[0])
         if isinstance(subset, int):
             if subset > 0:
@@ -99,8 +100,8 @@ class CelebADataset(torch.utils.data.Dataset):
         img_idx = idx // self.num_patches_per_img
         patch_idx = idx % self.num_patches_per_img
         path = os.path.join(self.img_dir, self.file_names[img_idx])
-        assert os.path.exists(path), 'Index does not specify any images in the dataset'
-        
+        assert os.path.exists(path), "Index does not specify any images in the dataset"
+
         img = Image.open(path)
 
         width, height = img.size  # Get dimensions
@@ -115,38 +116,38 @@ class CelebADataset(torch.utils.data.Dataset):
         if self.downsampled_size != img.size:
             img = img.resize(self.downsampled_size)
 
-        img = np.asarray(img).astype(np.float32) / 255.
+        img = np.asarray(img).astype(np.float32) / 255.0
 
         # crop patch size
         if self.num_patches_per_img != 1:
             num_patches_per_row = self.downsampled_size[0] // self.patch_size[0]  # width
             row_idx, col_idx = patch_idx // num_patches_per_row, patch_idx % num_patches_per_row
             y, x = row_idx * self.patch_size[1], col_idx * self.patch_size[0]
-            img = img[y:y+self.patch_size[1], x:x+self.patch_size[0]]
+            img = img[y : y + self.patch_size[1], x : x + self.patch_size[0]]
 
         # permute to CHW
         img = np.transpose(img, (2, 0, 1))
 
-        in_dict = {
-            'idx': torch.tensor(idx, dtype=torch.int64), 
-            'coords': get_mgrid(self.downsampled_size[0]) 
-            }
-        gt_dict = {'img': torch.from_numpy(img)}
+        in_dict = {"idx": torch.tensor(idx, dtype=torch.int64), "coords": get_mgrid(self.downsampled_size[0])}
+        gt_dict = {"img": torch.from_numpy(img)}
 
         return in_dict, gt_dict
-    
+
 
 class CIFAR10Dataset(torch.utils.data.Dataset):
 
-    def __init__(self, root, split='train', subset=-1, class_label=5):
+    def __init__(self, root, split="train", subset=-1, class_label=5):
         super().__init__()
 
-        transforms = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            # TransposeTransform(in_fmt='CHW', out_fmt='HWC')
-        ])
-        self.cifar10 = torchvision.datasets.CIFAR10(root=root, train=(split == 'train'),
-                download=True, transform=transforms)
+        transforms = torchvision.transforms.Compose(
+            [
+                torchvision.transforms.ToTensor(),
+                # TransposeTransform(in_fmt='CHW', out_fmt='HWC')
+            ]
+        )
+        self.cifar10 = torchvision.datasets.CIFAR10(
+            root=root, train=(split == "train"), download=True, transform=transforms
+        )
         # only keep all the dog images
         if class_label >= 0:
             self.images = [(img, label) for img, label in self.cifar10 if label == class_label]
@@ -154,7 +155,7 @@ class CIFAR10Dataset(torch.utils.data.Dataset):
             # keep all images
             self.images = self.cifar10
         if subset > 0:
-            subset_idx = np.linspace(0, len(self.images)-1, subset, dtype=np.int64)
+            subset_idx = np.linspace(0, len(self.images) - 1, subset, dtype=np.int64)
             self.images = torch.utils.data.Subset(self.images, subset_idx)
 
     @property
@@ -175,23 +176,24 @@ class CIFAR10Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         # return torch.mean(self.images[idx][0], dim=-1, keepdim=True), torch.tensor(idx, dtype=torch.int64)
         return self.images[idx][0], torch.tensor(idx, dtype=torch.int64)
-    
+
+
 class LatentsDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split='train', flat=False, subset=-1, layer=-1):
+    def __init__(self, root, split="train", flat=False, subset=-1, layer=-1):
         super().__init__()
-        if split == 'train':
-            latents_path = os.path.join(root, 'latents_train.pt')
-        elif split == 'test':
-            latents_path = os.path.join(root, 'latents_test.pt')
+        if split == "train":
+            latents_path = os.path.join(root, "latents_train.pt")
+        elif split == "test":
+            latents_path = os.path.join(root, "latents_test.pt")
         else:
-            raise ValueError('Invalid split')
+            raise ValueError("Invalid split")
         self.latents = torch.load(latents_path)
         if flat:
             self.latents = self.latents.view(self.latents.shape[0], -1)
         elif layer == 0:
             self.latents = self.latents[:, 0]
         elif layer > 0:
-            self.latents = self.latents[:, layer-1:layer+1]
+            self.latents = self.latents[:, layer - 1 : layer + 1]
         if subset > 0:
             self.latents = self.latents[:subset]
 
@@ -218,8 +220,9 @@ class LatentsDataset(torch.utils.data.Dataset):
 
 
 class ShapeNet(torch.utils.data.Dataset):
-    def __init__(self, split='train', sampling=None, root='datasets', 
-                 simple_output=False, random_scale=False, subset=-1):
+    def __init__(
+        self, split="train", sampling=None, root="datasets", simple_output=False, random_scale=False, subset=-1
+    ):
         self.dataset_root = root
         self.sampling = sampling
         self.init_model_bool = False
@@ -228,7 +231,7 @@ class ShapeNet(torch.utils.data.Dataset):
         self.random_scale = random_scale
         self.subset = subset
         self.init_model()
-        self.data_type = 'voxel'
+        self.data_type = "voxel"
 
     def __len__(self):
         # if self.split == "train":
@@ -236,18 +239,18 @@ class ShapeNet(torch.utils.data.Dataset):
         # else:
         #     return 8762
         return len(self.data_points_int)
-    
+
     def init_model(self):
         split = self.split
-        points_path = os.path.join(self.dataset_root, 'shapenet', 'all_vox256_img', 'data_points_int_' + split + '.pth')
-        values_path = os.path.join(self.dataset_root, 'shapenet', 'all_vox256_img', 'data_values_' + split + '.pth')
+        points_path = os.path.join(self.dataset_root, "shapenet", "all_vox256_img", "data_points_int_" + split + ".pth")
+        values_path = os.path.join(self.dataset_root, "shapenet", "all_vox256_img", "data_values_" + split + ".pth")
 
         self.data_points_int = torch.load(points_path).byte()
         self.data_values = torch.load(values_path).byte()
 
         if self.subset > 0:
-            self.data_points_int = self.data_points_int[:self.subset]
-            self.data_values = self.data_values[:self.subset]
+            self.data_points_int = self.data_points_int[: self.subset]
+            self.data_values = self.data_values[: self.subset]
 
     def __getitem__(self, idx):
         points = (self.data_points_int[idx].float() + 1) / 128 - 1
@@ -266,12 +269,12 @@ class ShapeNet(torch.utils.data.Dataset):
             return occs
 
         else:
-            in_dict = {'idx': idx, 'coords': points}
-            gt_dict = {'img': occs}
+            in_dict = {"idx": idx, "coords": points}
+            gt_dict = {"img": occs}
 
             return in_dict, gt_dict
-        
 
-if __name__ == '__main__':
-    lt_path = 'INR_LOE/save/20240503_123320_compute_latents_5_layer_b14_latent_64_30000/latents_train_e_596.pt'
+
+if __name__ == "__main__":
+    lt_path = "INR_LOE/save/20240503_123320_compute_latents_5_layer_b14_latent_64_30000/latents_train_e_596.pt"
     dataset = LatentsDataset(lt_path, flat=False, layer=4)

@@ -6,24 +6,25 @@
 # ---------------------------------------------------------------
 
 import argparse
-import torch
-import torch.nn as nn
-import numpy as np
-import os
 import math
-import torch.distributed as dist
-import torchvision
-import matplotlib.pyplot as plt
-from torch.multiprocessing import Process
-from torch.cuda.amp import autocast, GradScaler
+import os
 
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torchvision
+from torch.cuda.amp import GradScaler, autocast
+from torch.multiprocessing import Process
+
+import stage2.utils as utils
+import wandb
+from datasets import LatentsDataset, get_mgrid, get_mgrid_voxel
+from stage1.model import INRLoe
 from stage2.nvae import AutoEncoder
 from stage2.thirdparty.adamax import Adamax
-import stage2.utils as utils
-from stage1.model import INRLoe
-from datasets import LatentsDataset, get_mgrid, get_mgrid_voxel
-
-import wandb
+from stage2.vae_backbone import LayerVAE
 
 # from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
 # from fid.inception import InceptionV3
@@ -57,6 +58,7 @@ def main(args):
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     model = AutoEncoder(args, arch_instance)
+    # model = LayerVAE(latent_dim=args.gate_dim)
     model = model.cuda()
 
     logging.info('args = %s', args)
@@ -74,11 +76,7 @@ def main(args):
                                          weight_decay=args.weight_decay, eps=1e-3)
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate)
-    grad_scalar = GradScaler(2**10)
-
-    num_output = utils.num_output(args.dataset)
-    bpd_coeff = 1. / np.log(2.) / num_output
+        cnn_optimizer, float(args.epochs - args.warmup_epochs -1), eta_min=args.learning_rate)
 
     # set up the INR_LOE model
     if args.pred_type == 'image':
@@ -89,18 +87,19 @@ def main(args):
         input_dim, output_dim = 3, 1
     else:
         raise NotImplementedError
-    
-    inr_loe = INRLoe(input_dim=input_dim,
-                    output_dim=output_dim,
-                    hidden_dim=64,
-                    num_hidden=4,
-                    num_exps=[64,64,64,64,64],
-                    ks=[8,8,8,8,8],
-                    latent_size=64,
-                    gate_type='separate',
-                    ).cuda()
+
+    inr_loe = INRLoe(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        hidden_dim=64,
+        num_hidden=4,
+        num_exps=[64, 64, 64, 64, 64],
+        ks=[8, 8, 8, 8, 8],
+        latent_size=64,
+        gate_type='separate',
+    ).cuda()
     inr_loe.load_state_dict(torch.load(args.inr_ckpt))
-    
+
     # if load
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
     if args.cont_training:
@@ -110,7 +109,6 @@ def main(args):
         model.load_state_dict(checkpoint['state_dict'])
         model = model.cuda()
         cnn_optimizer.load_state_dict(checkpoint['optimizer'])
-        grad_scalar.load_state_dict(checkpoint['grad_scalar'])
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
         global_step = checkpoint['global_step']
     else:
@@ -129,13 +127,13 @@ def main(args):
         logging.info('epoch %d', epoch)
 
         # Training.
-        train_nelbo, train_mse, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, logging)
+        train_nelbo, train_mse, global_step = train(
+            epoch, train_queue, model, cnn_optimizer, global_step, warmup_iters, logging
+        )
         logging.info('train_nelbo epoch %f', train_nelbo)
         logging.info('train_mse epoch %f', train_mse)
         if args.wandb:
-            wandb.log({'train/nelbo_epoch': train_nelbo, 
-                       'train/mse_epoch': train_mse})
-
+            wandb.log({"train/nelbo_epoch": train_nelbo, "train/mse_epoch": train_mse})
 
         model.eval()
         # generate samples less frequently
@@ -145,21 +143,24 @@ def main(args):
                 num_samples = 16
                 for t in [0.7, 0.8, 0.9, 1.0]:
                     sample, _ = model.sample(num_samples, t)
+                    sample = sample.squeeze()
                     sample = sample * trainset.std + trainset.mean
                     render(args, epoch, inr_loe, sample, t)
 
-            valid_neg_log_p, valid_nelbo, valid_mse = test(valid_queue, model, num_samples=10, args=args, logging=logging)
-            logging.info('valid_nelbo %f', valid_nelbo)
-            logging.info('valid neg log p %f', valid_neg_log_p)
-            logging.info('valid mse %f', valid_mse)
-            logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
-            logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
+            valid_neg_log_p, valid_nelbo, valid_mse = test(
+                valid_queue, model, num_samples=10, args=args, logging=logging
+            )
+            logging.info("valid_nelbo %f", valid_nelbo)
+            logging.info("valid neg log p %f", valid_neg_log_p)
+            logging.info("valid mse %f", valid_mse)
+            # logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
+            # logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
 
             valid_metric = {
                 'val/neg_log_p': valid_neg_log_p,
                 'val/nelbo': valid_nelbo,
-                'val/bpd_log_p': valid_neg_log_p * bpd_coeff,
-                'val/bpd_elbo': valid_nelbo * bpd_coeff
+                # 'val/bpd_log_p': valid_neg_log_p * bpd_coeff,
+                # 'val/bpd_elbo': valid_nelbo * bpd_coeff
             }
             if args.wandb:
                 wandb.log(valid_metric)
@@ -167,14 +168,24 @@ def main(args):
         save_freq = int(np.ceil(args.epochs / 100))
         if epoch % save_freq == 0 or epoch == (args.epochs - 1):
             if args.global_rank == 0:
-                logging.info('saving the model.')
-                torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
-                            'optimizer': cnn_optimizer.state_dict(), 'global_step': global_step,
-                            'args': args, 'arch_instance': arch_instance, 'scheduler': cnn_scheduler.state_dict(),
-                            'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
+                logging.info("saving the model.")
+                torch.save(
+                    {
+                        "epoch": epoch + 1,
+                        "state_dict": model.state_dict(),
+                        "optimizer": cnn_optimizer.state_dict(),
+                        "global_step": global_step,
+                        "args": args,
+                        "arch_instance": arch_instance,
+                        "scheduler": cnn_scheduler.state_dict(),
+                    },
+                    checkpoint_file,
+                )
 
     # Final validation
-    valid_neg_log_p, valid_nelbo, valid_mse = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
+    valid_neg_log_p, valid_nelbo, valid_mse = test(
+        valid_queue, model, num_samples=10, args=args, logging=logging
+    )
     logging.info('final valid nelbo %f', valid_nelbo)
     logging.info('final valid neg log p %f', valid_neg_log_p)
     logging.info('final valid mse %f', valid_mse)
@@ -182,8 +193,8 @@ def main(args):
     valid_metric = {
         'val/neg_log_p': valid_neg_log_p,
         'val/nelbo': valid_nelbo,
-        'val/bpd_log_p': valid_neg_log_p * bpd_coeff,
-        'val/bpd_elbo': valid_nelbo * bpd_coeff
+        # 'val/bpd_log_p': valid_neg_log_p * bpd_coeff,
+        # 'val/bpd_elbo': valid_nelbo * bpd_coeff
     }
     if args.wandb:
         wandb.log(valid_metric)
@@ -191,31 +202,33 @@ def main(args):
     model.eval()
     with torch.no_grad():
         sample, zs = model.sample(16, t=1)
-        # add back mean and std
+        sample = sample.squeeze()
         sample = sample * trainset.std + trainset.mean
 
     # render the original samples
     render(args, epoch, inr_loe, sample)
 
-    for layer in range(5):
+    sample_layer = args.gate_layer  # + 1 # additional layer at the first latent
+    for layer in range(sample_layer):
         for idx in range(5):
-            fix_z = zs[:layer+1] + [None] * (5-layer-1)
+            fix_z = zs[: layer + 1] + [None] * (sample_layer - layer - 1)
             with torch.no_grad():
                 sample, _ = model.sample(16, t=1, fix_z=fix_z)
                 sample = sample * trainset.std + trainset.mean
             render(args, epoch, inr_loe, sample, t=1, fix_layer=layer, idx=idx)
 
+
 def render(args, epoch, inr_loe, sample, t=1, fix_layer=-1, idx=-1):
     inr_loe.eval()
     blend_alphas = [0] * 5
-    save_path = os.path.join(args.save, 'renders', f'epoch_{epoch}')
+    save_path = os.path.join(args.save, 'renders', f"epoch_{epoch}")
     if not os.path.exists(save_path):
         os.makedirs(save_path)
-    
+
     if args.pred_type == 'image':
         coords = get_mgrid(64).cuda()
         with torch.no_grad():
-            out, _, _, _ = inr_loe(sample, coords, False, blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
+            out, _, _, _ = inr_loe(sample, coords, False, blend_alphas=blend_alphas)  # N_imgs x N_coords x out_dim
         N, _, C = out.shape
         out = out.view(N, 64, 64, C).permute(0, 3, 1, 2)
         out = torch.clamp(out, 0, 1)
@@ -235,10 +248,10 @@ def render(args, epoch, inr_loe, sample, t=1, fix_layer=-1, idx=-1):
         fig = plt.figure()
         M = int(math.sqrt(N))
         for i, points in enumerate(valid_coords):
-            ax = fig.add_subplot(M,M,i+1, projection='3d')
+            ax = fig.add_subplot(M, M, i + 1, projection='3d')
             x, y, z = points[:, 0], points[:, 1], points[:, 2]
             ax.scatter(x, y, z, s=0.5, c=z, cmap='rainbow')
-            ax.view_init(elev=30, azim=45) 
+            ax.view_init(elev=30, azim=45)
             # if points are all zeros, set the limit to be -1, 1
             if np.allclose(points, 0):
                 min_lim, max_lim = -1, 1
@@ -247,7 +260,7 @@ def render(args, epoch, inr_loe, sample, t=1, fix_layer=-1, idx=-1):
             ax.set_xlim(min_lim, max_lim)
             ax.set_ylim(min_lim, max_lim)
             ax.set_zlim(min_lim, max_lim)
-            ax.set_box_aspect([1,1,1])
+            ax.set_box_aspect([1, 1, 1])
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_zticks([min_lim, max_lim])
@@ -257,12 +270,12 @@ def render(args, epoch, inr_loe, sample, t=1, fix_layer=-1, idx=-1):
                     bbox_inches='tight', dpi=300)
         
         plt.close(fig)
-    
+
     elif args.pred_type == 'scene':
         coords = get_mgrid(64).cuda()
 
 
-def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, logging):
+def train(epoch, train_queue, model, cnn_optimizer, global_step, warmup_iters, logging):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
@@ -279,7 +292,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         if global_step < warmup_iters:
             lr = args.learning_rate * float(global_step) / warmup_iters
             for param_group in cnn_optimizer.param_groups:
-                param_group['lr'] = lr
+                param_group["lr"] = lr
 
         # sync parameters, it may not be necessary
         if step % 100 == 0:
@@ -287,19 +300,38 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
         cnn_optimizer.zero_grad()
         with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(x)
-
+            logits, kl_all, kl_diag, log_q, log_p = model(x)
+            logits = logits.squeeze()
             # output = model.decoder_output(logits)
             # kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
             #                           args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
-            kl_coeff = utils.kl_coeff_cycle_linear(global_step, args.num_total_iter, args.kl_const_coeff, args.kl_max_coeff,
-                                                   n_cycle=args.kl_cycle, ratio=args.kl_anneal_portion, constant_ratio=args.kl_const_portion)
+            # kl_coeff = utils.kl_coeff_cycle_linear(global_step, args.num_total_iter, args.kl_const_coeff, args.kl_max_coeff,
+            #                                        n_cycle=args.kl_cycle, ratio=args.kl_anneal_portion, constant_ratio=args.kl_const_portion)
+            if epoch % 2 < 1:
+                kl_coeff = args.kl_max_coeff * (step + epoch % 1 * len(train_queue)) / (1 * len(train_queue))
+            elif epoch % 2 < 2:
+                kl_coeff = args.kl_max_coeff
             # recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
             recon_loss = utils.mse_loss(logits, x)
-            balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+            # recon_loss = ((logits-x)**2).sum(dim=(1,2))
+            recon_loss = recon_loss.mean()
 
+            # get kld loss
+            kl_all = torch.stack(kl_all, dim=1)
+            kl_coeff_i, kl_vals = utils.kl_per_group(kl_all)
+            total_kl = torch.sum(kl_coeff_i)
+
+            kl_coeff_i = kl_coeff_i / (1.0 * total_kl)
+            kl_coeff_i = kl_coeff_i / torch.mean(kl_coeff_i, dim=1, keepdim=True)
+            # kld_loss = torch.mean(kl_all * (kl_coeff_i.detach()))
+            kld_loss = torch.sum(kl_all * (kl_coeff_i.detach()), dim=1)
+            kld_loss = kld_loss.mean()
+            kl_coeffs = kl_coeff_i.squeeze(0)
+
+            # balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+            # nelbo_batch = recon_loss + balanced_kl
+            nelbo_batch = recon_loss + kld_loss * kl_coeff
             
-            nelbo_batch = recon_loss + balanced_kl
             mse_loss = torch.mean(recon_loss)
             loss = torch.mean(nelbo_batch)
             # norm_loss = model.spectral_norm_parallel()
@@ -321,7 +353,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         cnn_optimizer.step()
         # grad_scalar.update()
         nelbo.update(loss.data, 1)
-        mse.update(mse_loss.data, 1)
+        # mse.update(mse_loss.data, 1)
 
         if (global_step + 1) % 100 == 0:
             # if (global_step + 1) % 1000 == 0:  # reduced frequency
@@ -341,17 +373,17 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
             utils.average_tensor(nelbo.avg, args.distributed)
             utils.average_tensor(mse.avg, args.distributed)
-            logging.info('train %d %f %f', global_step, nelbo.avg, mse.avg)
-        
+            logging.info("train %d %f %f", global_step, nelbo.avg, mse.avg)
+
             # writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)), global_step)
             train_metric = {
-                'train/nelbo_avg': nelbo.avg,
-                'train/mse_avg': mse.avg,
-                'train/lr': cnn_optimizer.state_dict()['param_groups'][0]['lr'],
-                'train/nelbo_iter': loss,
-                'train/kl_iter': torch.mean(sum(kl_all)),
-                'train/mse_iter': mse_loss,
-                'kl_coeff/coeff': kl_coeff
+                "train/nelbo_avg": nelbo.avg,
+                "train/mse_avg": mse.avg,
+                "train/lr": cnn_optimizer.state_dict()["param_groups"][0]["lr"],
+                "train/nelbo_iter": loss,
+                "train/kl_iter": torch.mean(torch.sum(kl_all, dim=1)),
+                "train/mse_iter": mse_loss,
+                "kl_coeff/coeff": kl_coeff,
             }
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
@@ -361,11 +393,11 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
                 # kl_ceoff
                 # update the metrics
-                train_metric[f'kl/active_{i}'] = num_active
-                train_metric[f'kl_coeff/layer_{i}'] = kl_coeffs[i]
-                train_metric[f'kl_vals/layer_{i}'] = kl_vals[i]
+                train_metric[f"kl/active_{i}"] = num_active
+                train_metric[f"kl_coeff/layer_{i}"] = kl_coeffs[i]
+                train_metric[f"kl_vals/layer_{i}"] = kl_vals[i]
             # writer.add_scalar('kl/total_active', total_active, global_step)
-            train_metric['kl/total_active'] = total_active
+            train_metric["kl/total_active"] = total_active
 
             if args.wandb:
                 wandb.log(train_metric)
@@ -394,23 +426,43 @@ def test(valid_queue, model, num_samples, args, logging):
         with torch.no_grad():
             nelbo, log_iw, mse = [], [], 0
             for k in range(num_samples):
-                logits, log_q, log_p, kl_all, _ = model(x)
+                logits, kl_all, _, log_q, log_p = model(x)
+                logits = logits.squeeze()
                 # output = model.decoder_output(logits)
                 # recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
                 recon_loss = utils.mse_loss(logits, x)
-                balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
-                nelbo_batch = recon_loss + balanced_kl
+                # recon_loss = ((logits-x)**2).sum(dim=(1,2))
+                recon_loss = recon_loss.mean()
+
+                # balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
+                # nelbo_batch = recon_loss + balanced_kl
+
+                # get kld loss
+                kl_all = torch.stack(kl_all, dim=1)
+                # kl_coeff_i, kl_vals = utils.kl_per_group(kl_all)
+                # total_kl = torch.sum(kl_coeff_i)
+
+                # kl_coeff_i = kl_coeff_i / (1.0 * total_kl)
+                # kl_coeff_i = kl_coeff_i / torch.mean(kl_coeff_i, dim=1, keepdim=True)
+                # kld_loss = torch.mean(kl_all * (kl_coeff_i.detach()))
+                # kld_loss = torch.sum(kl_all * (kl_coeff_i.detach()), dim=1)
+                kld_loss = torch.sum(kl_all, dim=1)
+                kld_loss = kld_loss.mean()
+                # kl_coeffs = kl_coeff_i.squeeze(0)
+
+                nelbo_batch = recon_loss + kld_loss
                 nelbo.append(nelbo_batch)
                 mse += recon_loss
                 # log_iw.append(utils.log_iw(output, x, log_q, log_p, crop=model.crop_output))
                 log_iw.append(utils.log_iw_mse(logits, x, log_q, log_p))
 
-            nelbo = torch.mean(torch.stack(nelbo, dim=1))
+            # nelbo = torch.mean(torch.stack(nelbo, dim=1))
+            nelbo = torch.mean(torch.stack(nelbo))
             log_p = torch.mean(torch.logsumexp(torch.stack(log_iw, dim=1), dim=1) - np.log(num_samples))
             mse = mse / num_samples
 
         nelbo_avg.update(nelbo.data, x.size(0))
-        neg_log_p_avg.update(- log_p.data, x.size(0))
+        neg_log_p_avg.update(-log_p.data, x.size(0))
         mse_avg.update(mse.data, x.size(0))
 
     utils.average_tensor(nelbo_avg.avg, args.distributed)
@@ -464,11 +516,11 @@ def create_generator_vae(model, batch_size, num_total_samples):
 
 
 def init_processes(rank, size, fn, args):
-    """ Initialize the distributed environment. """
-    os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = '6020'
+    """Initialize the distributed environment."""
+    os.environ["MASTER_ADDR"] = args.master_address
+    os.environ["MASTER_PORT"] = "6021"
     torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
+    dist.init_process_group(backend="nccl", init_method="env://", rank=rank, world_size=size)
     fn(args)
     cleanup()
 
@@ -477,8 +529,8 @@ def cleanup():
     dist.destroy_process_group()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('encoder decoder examiner')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser("encoder decoder examiner")
     # experimental results
     parser.add_argument('--root', type=str, default='loe_nvae/exp',
                         help='location of the results')
@@ -603,9 +655,8 @@ if __name__ == '__main__':
                         help='location of the INR_LOE checkpoint')
     
     # wandb
-    parser.add_argument('--wandb', type=bool, default=True,
-                        help='This flag enables logging to wandb.')
-    
+    parser.add_argument("--wandb", type=bool, default=True, help="This flag enables logging to wandb.")
+
     args = parser.parse_args()
     # args.save = args.root + '/eval-' + args.save
     args.save = os.path.join(args.latent_path, args.save)
@@ -621,7 +672,7 @@ if __name__ == '__main__':
             global_rank = rank + args.node_rank * args.num_process_per_node
             global_size = args.num_proc_node * args.num_process_per_node
             args.global_rank = global_rank
-            print('Node rank %d, local proc %d, global proc %d' % (args.node_rank, rank, global_rank))
+            print("Node rank %d, local proc %d, global proc %d" % (args.node_rank, rank, global_rank))
             p = Process(target=init_processes, args=(global_rank, global_size, main, args))
             p.start()
             processes.append(p)
@@ -630,9 +681,7 @@ if __name__ == '__main__':
             p.join()
     else:
         # for debugging
-        print('starting in debug mode')
+        print("starting in debug mode")
         # args.distributed = True
         args.distributed = False
         init_processes(0, size, main, args)
-
-

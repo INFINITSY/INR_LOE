@@ -7,19 +7,23 @@
 
 
 import time
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .neural_operations import OPS, EncCombinerCell, DecCombinerCell, Conv2D, get_skip_connection, SE, \
-                                EncCombinerLinearCell, DecCombinerLinearCell, ResMLPCell, LinearBNReLU
-from .neural_ar_operations import ARConv2d, ARInvertedResidual, MixLogCDFParam, mix_log_cdf_flow
-from .neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
 
-from .utils import get_stride_for_cell_type, get_input_size, groups_per_scale
-from .distributions import Normal, DiscMixLogistic, NormalDecoder
+from .distributions import DiscMixLogistic, Normal, NormalDecoder
+from .neural_ar_operations import ARConv2d, ARInvertedResidual
+from .neural_ar_operations import ELUConv as ARELUConv
+from .neural_ar_operations import MixLogCDFParam, mix_log_cdf_flow
+from .neural_operations import (OPS, SE, Conv2D, DecCombinerCell,
+                                DecCombinerLinearCell, EncCombinerCell,
+                                EncCombinerLinearCell, LinearBNReLU,
+                                ResMLPCell, get_skip_connection)
 from .thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
+from .utils import get_input_size, get_stride_for_cell_type, groups_per_scale
 
 # CHANNEL_MULT = 2
 CHANNEL_MULT = 1
@@ -31,7 +35,9 @@ class Cell(nn.Module):
         self.cell_type = cell_type
 
         stride = get_stride_for_cell_type(self.cell_type)
-        self.skip = get_skip_connection(Cin, stride, affine=False, channel_mult=CHANNEL_MULT)
+        self.skip = get_skip_connection(
+            Cin, stride, affine=False, channel_mult=CHANNEL_MULT
+        )
         self.use_se = use_se
         self._num_nodes = len(arch)
         self._ops = nn.ModuleList()
@@ -61,7 +67,7 @@ class CellAR(nn.Module):
         super(CellAR, self).__init__()
         assert num_c % num_z == 0
 
-        self.cell_type = 'ar_nn'
+        self.cell_type = "ar_nn"
 
         # s0 will the random samples
         ex = 6
@@ -69,11 +75,21 @@ class CellAR(nn.Module):
 
         self.use_mix_log_cdf = False
         if self.use_mix_log_cdf:
-            self.param = MixLogCDFParam(num_z, num_mix=3, num_ftr=self.conv.hidden_dim, mirror=mirror)
+            self.param = MixLogCDFParam(
+                num_z, num_mix=3, num_ftr=self.conv.hidden_dim, mirror=mirror
+            )
         else:
             # 0.1 helps bring mu closer to 0 initially
-            self.mu = ARELUConv(self.conv.hidden_dim, num_z, kernel_size=1, padding=0, masked=True, zero_diag=False,
-                                weight_init_coeff=0.1, mirror=mirror)
+            self.mu = ARELUConv(
+                self.conv.hidden_dim,
+                num_z,
+                kernel_size=1,
+                padding=0,
+                masked=True,
+                zero_diag=False,
+                weight_init_coeff=0.1,
+                mirror=mirror,
+            )
 
     def forward(self, z, ftr):
         s = self.conv(z, ftr)
@@ -83,7 +99,7 @@ class CellAR(nn.Module):
             new_z, log_det = mix_log_cdf_flow(z, logit_pi, mu, log_s, log_a, b)
         else:
             mu = self.mu(s)
-            new_z = (z - mu)
+            new_z = z - mu
             log_det = torch.zeros_like(new_z)
 
         return new_z, log_det
@@ -104,9 +120,10 @@ class PairedCellAR(nn.Module):
 
 
 class AutoEncoder(nn.Module):
-    '''
+    """
     Modified from the original NVAE code to support layer-wise supervision.
-    '''
+    """
+
     def __init__(self, args, arch_instance):
         super(AutoEncoder, self).__init__()
         self.arch_instance = arch_instance
@@ -120,26 +137,46 @@ class AutoEncoder(nn.Module):
         self.gate_dim = args.gate_dim
         self.gate_layer = args.gate_layer
 
-        self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
-        self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
-        self.num_latent_per_group = args.num_latent_per_group   # number of latent vars. per group
-        self.groups_per_scale = groups_per_scale(self.num_latent_scales, self.num_groups_per_scale, args.ada_groups,
-                                                 minimum_groups=args.min_groups_per_scale)
+        self.num_latent_scales = (
+            args.num_latent_scales
+        )  # number of spatial scales that latent layers will reside
+        self.num_groups_per_scale = (
+            args.num_groups_per_scale
+        )  # number of groups of latent vars. per scale
+        self.num_latent_per_group = (
+            args.num_latent_per_group
+        )  # number of latent vars. per group
+        self.groups_per_scale = groups_per_scale(
+            self.num_latent_scales,
+            self.num_groups_per_scale,
+            args.ada_groups,
+            minimum_groups=args.min_groups_per_scale,
+        )
 
-        self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
+        self.vanilla_vae = (
+            self.num_latent_scales == 1 and self.num_groups_per_scale == 1
+        )
 
         # encoder parameteres
         self.num_channels_enc = args.num_channels_enc
         self.num_channels_dec = args.num_channels_dec
-        self.num_preprocess_blocks = args.num_preprocess_blocks  # block is defined as series of Normal followed by Down
-        self.num_preprocess_cells = args.num_preprocess_cells   # number of cells per block
-        self.num_cell_per_cond_enc = args.num_cell_per_cond_enc  # number of cell for each conditional in encoder
+        self.num_preprocess_blocks = (
+            args.num_preprocess_blocks
+        )  # block is defined as series of Normal followed by Down
+        self.num_preprocess_cells = (
+            args.num_preprocess_cells
+        )  # number of cells per block
+        self.num_cell_per_cond_enc = (
+            args.num_cell_per_cond_enc
+        )  # number of cell for each conditional in encoder
 
         # decoder parameters
         # self.num_channels_dec = args.num_channels_dec
         self.num_postprocess_blocks = args.num_postprocess_blocks
         self.num_postprocess_cells = args.num_postprocess_cells
-        self.num_cell_per_cond_dec = args.num_cell_per_cond_dec  # number of cell for each conditional in decoder
+        self.num_cell_per_cond_dec = (
+            args.num_cell_per_cond_dec
+        )  # number of cell for each conditional in decoder
 
         # general cell parameters
         # self.input_size = get_input_size(self.dataset)
@@ -148,7 +185,9 @@ class AutoEncoder(nn.Module):
         self.num_mix_output = args.num_mixture_dec
 
         # used for generative purpose
-        c_scaling = CHANNEL_MULT ** (self.num_preprocess_blocks + self.num_latent_scales - 1)
+        c_scaling = CHANNEL_MULT ** (
+            self.num_preprocess_blocks + self.num_latent_scales - 1
+        )
         # spatial_scaling = 2 ** (self.num_preprocess_blocks + self.num_latent_scales - 1)
         # prior_ftr0_size = (int(c_scaling * self.num_channels_dec), self.input_size // spatial_scaling,
         #                    self.input_size // spatial_scaling)
@@ -193,12 +232,15 @@ class AutoEncoder(nn.Module):
             if isinstance(layer, Conv2D) or isinstance(layer, ARConv2d):
                 self.all_log_norm.append(layer.log_weight_norm)
                 self.all_conv_layers.append(layer)
-            if isinstance(layer, nn.BatchNorm2d) or isinstance(layer, nn.SyncBatchNorm) or \
-                    isinstance(layer, SyncBatchNormSwish):
+            if (
+                isinstance(layer, nn.BatchNorm2d)
+                or isinstance(layer, nn.SyncBatchNorm)
+                or isinstance(layer, SyncBatchNormSwish)
+            ):
                 self.all_bn_layers.append(layer)
 
-        print('len log norm:', len(self.all_log_norm))
-        print('len bn:', len(self.all_bn_layers))
+        print("len log norm:", len(self.all_log_norm))
+        print("len bn:", len(self.all_bn_layers))
         # left/right singular vectors used for SR
         self.sr_u = {}
         self.sr_v = {}
@@ -207,19 +249,19 @@ class AutoEncoder(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(20, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 64),
             # nn.Sigmoid()  # Use sigmoid if the data is normalized between 0 and 1
         )
@@ -227,19 +269,19 @@ class AutoEncoder(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(64, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) ,
+            nn.LeakyReLU(0.1),
             nn.Linear(48, 48),
             nn.BatchNorm1d(48),
-            nn.LeakyReLU(0.1) 
+            nn.LeakyReLU(0.1),
         )
         self.fc_mu = nn.Linear(48, 20)
         self.fc_var = nn.Linear(48, 20)
@@ -250,10 +292,14 @@ class AutoEncoder(nn.Module):
         Cout = self.num_channels_enc
         Cin = self.gate_dim
         stems = nn.ModuleList(
-            [nn.Sequential(
-                nn.Linear(Cin, Cout, bias=True),
-                nn.BatchNorm1d(Cout),
-                nn.LeakyReLU(0.1)) for _ in range(self.gate_layer)]
+            [
+                nn.Sequential(
+                    nn.Linear(Cin, Cout, bias=True),
+                    nn.BatchNorm1d(Cout),
+                    nn.LeakyReLU(0.1),
+                )
+                for _ in range(self.gate_layer)
+            ]
         )
         # stem = nn.Linear(Cin, Cout, bias=True)
         return stems
@@ -280,15 +326,15 @@ class AutoEncoder(nn.Module):
     def init_encoder_tower(self, mult):
         enc_tower = nn.ModuleList()
         enc_combiners = nn.ModuleList()
-        for l in range(self.gate_layer):
+        for layer_index in range(self.gate_layer):
             num_ce = int(self.num_channels_enc)
             num_cd = int(self.num_channels_dec)
             # TODO: change linear to MLP
             # cell = nn.Linear(num_ce, num_ce, bias=True)
             # cell = ResMLPCell(num_ce, num_ce, cell_type='normal_enc')
-            cell = LinearBNReLU(num_ce, num_ce, cell_type='normal_enc')
+            cell = LinearBNReLU(num_ce, num_ce, cell_type="normal_enc")
             enc_tower.append(cell)
-            if l > 0:
+            if layer_index > 0:
                 cell = EncCombinerLinearCell(num_ce, num_cd, num_ce)
                 enc_combiners.append(cell)
 
@@ -324,11 +370,16 @@ class AutoEncoder(nn.Module):
             nn.ELU(),
             # Conv2D(num_c, num_c, kernel_size=1, bias=True),
             nn.Linear(num_c, num_c, bias=True),
-            nn.ELU())
+            nn.ELU(),
+        )
         return cell
 
     def init_normal_sampler(self, mult):
-        enc_sampler, dec_sampler, nf_cells = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
+        enc_sampler, dec_sampler, nf_cells = (
+            nn.ModuleList(),
+            nn.ModuleList(),
+            nn.ModuleList(),
+        )
         enc_kv, dec_kv, query = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for s in range(self.num_latent_scales):
             for g in range(self.groups_per_scale[self.num_latent_scales - s - 1]):
@@ -339,17 +390,21 @@ class AutoEncoder(nn.Module):
                 enc_sampler.append(cell)
                 # build NF
                 for n in range(self.num_flows):
-                    arch = self.arch_instance['ar_nn']
+                    arch = self.arch_instance["ar_nn"]
                     num_c1 = int(self.num_channels_enc * mult)
                     num_c2 = 8 * self.num_latent_per_group  # use 8x features
-                    nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
-                if not (s == 0 and g == 0):  # for the first group, we use a fixed standard Normal.
+                    nf_cells.append(
+                        PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch)
+                    )
+                if not (
+                    s == 0 and g == 0
+                ):  # for the first group, we use a fixed standard Normal.
                     num_c = int(self.num_channels_dec * mult)
                     cell = nn.Sequential(
                         nn.ELU(),
                         # Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=1, padding=0, bias=True)
-                        nn.Linear(num_c, 2 * self.num_latent_per_group, bias=True)
-                        )
+                        nn.Linear(num_c, 2 * self.num_latent_per_group, bias=True),
+                    )
                     dec_sampler.append(cell)
 
             mult = mult / CHANNEL_MULT
@@ -365,13 +420,13 @@ class AutoEncoder(nn.Module):
                 num_c = int(self.num_channels_dec * mult)
                 if not (s == 0 and g == 0):
                     for c in range(self.num_cell_per_cond_dec):
-                        arch = self.arch_instance['normal_dec']
+                        # arch = self.arch_instance["normal_dec"]
                         # cell = Cell(num_c, num_c, cell_type='normal_dec', arch=arch, use_se=self.use_se)
                         # TODO: change linear to MLP
                         # cell = nn.Linear(num_c, num_c, bias=True)
                         # cell = ResMLPCell(num_c, num_c, cell_type='normal_dec')
                         # c_in = int(self.num_latent_per_group)
-                        cell = LinearBNReLU(num_c, num_c, cell_type='normal_dec')
+                        cell = LinearBNReLU(num_c, num_c, cell_type="normal_dec")
                         dec_tower.append(cell)
                     # add decoder regressor at the end of each group
                     cell = nn.Linear(num_c, self.gate_dim, bias=True)
@@ -380,7 +435,12 @@ class AutoEncoder(nn.Module):
                 # cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec')
                 if g < self.groups_per_scale[self.num_latent_scales - s - 1]:
                     # last group does not need combiner
-                    cell = DecCombinerLinearCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec')
+                    cell = DecCombinerLinearCell(
+                        num_c,
+                        self.num_latent_per_group,
+                        num_c,
+                        cell_type="combiner_dec",
+                    )
                     dec_tower.append(cell)
 
             # down cells after finishing a scale
@@ -426,9 +486,9 @@ class AutoEncoder(nn.Module):
     #                          Conv2D(C_in, C_out, 3, padding=1, bias=True))
 
     def forward(self, x, return_latent=False):
-        '''
+        """
         x: input gatings (B, num_layer, gate_dim)
-        '''
+        """
         num_layer = x.size(1)
         # s = self.stem(2 * x - 1.0)
         # TODO: right now apply the same stem to all layers, should be changed to layer-wise stem
@@ -450,32 +510,14 @@ class AutoEncoder(nn.Module):
         # all_log_q = []
         # all_log_p = []
         # latents = None
-        for l in range(num_layer):
-            s_layer = self.stem[l](x[:, l, :])
-            s_layer = self.encoders[l](s_layer)
-        #     param = self.enc_sampler[l](s)
-        #     mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
-        #     dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
-        #     z, _ = dist.sample()
-            
-
-        #     log_q_conv = dist.log_p(z)
-        #     log_p_conv = dist.log_p(z)
-        #     all_q.append(dist)
-        #     all_p.append(dist)
-        #     all_log_q.append(log_q_conv)
-        #     all_log_p.append(log_p_conv)
-
-        #     s = self.dec_tower[l](z)
-        #     y = self.dec_regressors[l](s)
-
-        #     logits.append(y)
-        # logits = torch.stack(logits, dim=1)
-            if l == 0:
+        for layer_index in range(num_layer):
+            s_layer = self.stem[layer_index](x[:, layer_index, :])
+            s_layer = self.encoders[layer_index](s_layer)
+            if layer_index == 0:
                 s = s_layer
             else:
                 combiner_cells_s.append(s_layer)
-                combiner_cells_enc.append(self.enc_combiners[l-1])
+                combiner_cells_enc.append(self.enc_combiners[layer_index - 1])
 
         # for cell in self.enc_tower:
         #     if cell.cell_type == 'combiner_enc':
@@ -490,11 +532,11 @@ class AutoEncoder(nn.Module):
 
         #############################
         idx_dec = 0
-        ftr = self.enc0(s)                            # this reduces the channel dimension
+        ftr = self.enc0(s)  # this reduces the channel dimension
         # ftr = s
         param0 = self.enc_sampler[idx_dec](ftr)
         mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
-        dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
+        dist = Normal(mu_q, log_sig_q)  # for the first approx. posterior
         z, _ = dist.sample()
         log_q_conv = dist.log_p(z)
 
@@ -525,17 +567,23 @@ class AutoEncoder(nn.Module):
         if return_latent:
             latents = [s]
         for cell in self.dec_tower:
-            if cell.cell_type == 'combiner_dec':
+            if cell.cell_type == "combiner_dec":
                 if idx_dec > 0:
                     # form prior
                     param = self.dec_sampler[idx_dec - 1](s)
                     mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
 
                     # form encoder
-                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
+                    ftr = combiner_cells_enc[idx_dec - 1](
+                        combiner_cells_s[idx_dec - 1], s
+                    )
                     param = self.enc_sampler[idx_dec](ftr)
                     mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
-                    dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
+                    dist = (
+                        Normal(mu_p + mu_q, log_sig_p + log_sig_q)
+                        if self.res_dist
+                        else Normal(mu_q, log_sig_q)
+                    )
                     z, _ = dist.sample()
                     log_q_conv = dist.log_p(z)
                     # apply NF
@@ -580,7 +628,7 @@ class AutoEncoder(nn.Module):
         # compute kl
         kl_all = []
         kl_diag = []
-        log_p, log_q = 0., 0.
+        log_p, log_q = 0.0, 0.0
         for q, p, log_q_conv, log_p_conv in zip(all_q, all_p, all_log_q, all_log_p):
             if self.with_nf:
                 kl_per_var = log_q_conv - log_p_conv
@@ -596,23 +644,28 @@ class AutoEncoder(nn.Module):
             log_q += torch.sum(log_q_conv, dim=1)
             log_p += torch.sum(log_p_conv, dim=1)
         if return_latent:
-            return logits, log_q, log_p, kl_all, kl_diag, latents
+            return logits, kl_all, kl_diag, log_q, log_p, latents
         else:
-            return logits, log_q, log_p, kl_all, kl_diag
+            return logits, kl_all, kl_diag, log_q, log_p
 
-    def sample(self, num_samples, t, return_latent=False, fix_z=[None]*5):
+    def sample(self, num_samples, t, return_latent=False, fix_z=[None] * 5):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         if fix_z[0] is not None:
             z = fix_z[0]
         else:
-            dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=t)
+            dist = Normal(
+                mu=torch.zeros(z0_size).cuda(),
+                log_sigma=torch.zeros(z0_size).cuda(),
+                temp=t,
+            )
             z, _ = dist.sample()
 
         zs = [z]
 
         idx_dec = 0
         logits = []
+        log_sigmas = []
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
         # s = s.expand(batch_size, -1, -1, -1)
@@ -620,7 +673,7 @@ class AutoEncoder(nn.Module):
         if return_latent:
             latents = [s]
         for cell in self.dec_tower:
-            if cell.cell_type == 'combiner_dec':
+            if cell.cell_type == "combiner_dec":
                 if idx_dec > 0:
                     if fix_z[idx_dec] is not None:
                         z = fix_z[idx_dec]
@@ -628,6 +681,7 @@ class AutoEncoder(nn.Module):
                         # form prior
                         param = self.dec_sampler[idx_dec - 1](s)
                         mu, log_sigma = torch.chunk(param, 2, dim=1)
+                        log_sigmas.append(log_sigma)
                         dist = Normal(mu, log_sigma, t)
                         z, _ = dist.sample()
                     zs.append(z)
@@ -644,7 +698,7 @@ class AutoEncoder(nn.Module):
                     latents.append(s)
             else:
                 s = cell(s)
-                if cell.cell_type == 'up_dec':
+                if cell.cell_type == "up_dec":
                     scale_ind += 1
         y = self.dec_regressors[-1](s)
         logits.append(y)
@@ -659,7 +713,7 @@ class AutoEncoder(nn.Module):
         logits = torch.stack(logits, dim=1)
         if return_latent:
             return logits, latents
-        return logits, zs
+        return logits, zs, log_sigmas
 
     # def decoder_output(self, logits):
     #     if self.dataset in {'mnist', 'omniglot'}:
@@ -674,10 +728,10 @@ class AutoEncoder(nn.Module):
     #         raise NotImplementedError
 
     def spectral_norm_parallel(self):
-        """ This method computes spectral normalization for all conv layers in parallel. This method should be called
-         after calling the forward method of all the conv layers in each iteration. """
+        """This method computes spectral normalization for all conv layers in parallel. This method should be called
+        after calling the forward method of all the conv layers in each iteration."""
 
-        weights = {}   # a dictionary indexed by the shape of weights
+        weights = {}  # a dictionary indexed by the shape of weights
         for l in self.all_conv_layers:
             weight = l.weight_normalized
             weight_mat = weight.view(weight.size(0), -1)
@@ -693,8 +747,12 @@ class AutoEncoder(nn.Module):
                 num_iter = self.num_power_iter
                 if i not in self.sr_u:
                     num_w, row, col = weights[i].shape
-                    self.sr_u[i] = F.normalize(torch.ones(num_w, row).normal_(0, 1).cuda(), dim=1, eps=1e-3)
-                    self.sr_v[i] = F.normalize(torch.ones(num_w, col).normal_(0, 1).cuda(), dim=1, eps=1e-3)
+                    self.sr_u[i] = F.normalize(
+                        torch.ones(num_w, row).normal_(0, 1).cuda(), dim=1, eps=1e-3
+                    )
+                    self.sr_v[i] = F.normalize(
+                        torch.ones(num_w, col).normal_(0, 1).cuda(), dim=1, eps=1e-3
+                    )
                     # increase the number of iterations for the first time
                     num_iter = 10 * self.num_power_iter
 
@@ -702,12 +760,21 @@ class AutoEncoder(nn.Module):
                     # Spectral norm of weight equals to `u^T W v`, where `u` and `v`
                     # are the first left and right singular vectors.
                     # This power iteration produces approximations of `u` and `v`.
-                    self.sr_v[i] = F.normalize(torch.matmul(self.sr_u[i].unsqueeze(1), weights[i]).squeeze(1),
-                                               dim=1, eps=1e-3)  # bx1xr * bxrxc --> bx1xc --> bxc
-                    self.sr_u[i] = F.normalize(torch.matmul(weights[i], self.sr_v[i].unsqueeze(2)).squeeze(2),
-                                               dim=1, eps=1e-3)  # bxrxc * bxcx1 --> bxrx1  --> bxr
+                    self.sr_v[i] = F.normalize(
+                        torch.matmul(self.sr_u[i].unsqueeze(1), weights[i]).squeeze(1),
+                        dim=1,
+                        eps=1e-3,
+                    )  # bx1xr * bxrxc --> bx1xc --> bxc
+                    self.sr_u[i] = F.normalize(
+                        torch.matmul(weights[i], self.sr_v[i].unsqueeze(2)).squeeze(2),
+                        dim=1,
+                        eps=1e-3,
+                    )  # bxrxc * bxcx1 --> bxrx1  --> bxr
 
-            sigma = torch.matmul(self.sr_u[i].unsqueeze(1), torch.matmul(weights[i], self.sr_v[i].unsqueeze(2)))
+            sigma = torch.matmul(
+                self.sr_u[i].unsqueeze(1),
+                torch.matmul(weights[i], self.sr_v[i].unsqueeze(2)),
+            )
             loss += torch.sum(sigma)
         return loss
 
@@ -718,4 +785,3 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
-
