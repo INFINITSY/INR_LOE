@@ -13,7 +13,7 @@ def get_mgrid(sidelen, dim=2, max=1.0):
     sidelen: int
     dim: int"""
     tensors = tuple(dim * [torch.linspace(-max, max, steps=sidelen)])
-    mgrid = torch.stack(torch.meshgrid(*tensors), dim=-1)
+    mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1)
     mgrid = mgrid.reshape(-1, dim)
     return mgrid
 
@@ -117,6 +117,8 @@ class CelebADataset(torch.utils.data.Dataset):
             img = img.resize(self.downsampled_size)
 
         img = np.asarray(img).astype(np.float32) / 255.0
+        # to -1, 1
+        img = 2 * img - 1
 
         # crop patch size
         if self.num_patches_per_img != 1:
@@ -133,6 +135,68 @@ class CelebADataset(torch.utils.data.Dataset):
 
         return in_dict, gt_dict
 
+
+class CelebAHQ(torch.utils.data.Dataset):
+    def __init__(self, root, split, subset=-1, downsampled_size=None, tf_dataset=False):
+        # SIZE (128 x 128)
+        # super().__init__(self)
+        assert split in ['train', 'test'], "Unknown split"
+
+        self.dataset_root = root
+        self.root = os.path.join(self.dataset_root, 'CelebAHQ')
+        self.img_channels = 3
+        self.fnames = []
+        if tf_dataset:
+            nameformat = 'img%08d.png'
+            train_range = range(0, 27000)
+            test_range = range(27000, 30000)
+        else:
+            nameformat = '%05d.jpg'
+            train_range = range(1, 27001)
+            test_range = range(27001, 30001)
+        if split == 'train':
+            for i in train_range:
+                self.fnames.append(nameformat % i)
+        elif split == 'test':
+            for i in test_range:
+                self.fnames.append(nameformat % i)
+        if isinstance(subset, int):
+            if subset > 0:
+                self.fnames = self.fnames[:subset]
+        elif isinstance(subset, list):
+            self.fnames = [self.fnames[i] for i in subset]
+
+        self.downsampled_size = downsampled_size if downsampled_size is not None else (128, 128)
+
+    def __len__(self):
+        return len(self.fnames)
+
+    def __getitem__(self, idx):
+        path = os.path.join(self.root, self.fnames[idx])
+        img = Image.open(path)
+        if self.downsampled_size != img.size:
+            width, height = img.size  # Get dimensions
+
+            # s = min(width, height)
+            # left = (width - s) / 2
+            # top = (height - s) / 2
+            # right = (width + s) / 2
+            # bottom = (height + s) / 2
+            # img = img.crop((left, top, right, bottom))
+            img = img.resize(self.downsampled_size, resample=Image.BICUBIC)
+        
+        img = np.asarray(img).astype(np.float32) / 255.0
+        # to -1, 1
+        img = 2 * img - 1
+
+        # permute to CHW
+        img = np.transpose(img, (2, 0, 1))
+
+        in_dict = {"idx": torch.tensor(idx, dtype=torch.int64), "coords": get_mgrid(self.downsampled_size[0])}
+        gt_dict = {"img": torch.from_numpy(img)}
+
+        return in_dict, gt_dict
+    
 
 class CIFAR10Dataset(torch.utils.data.Dataset):
 

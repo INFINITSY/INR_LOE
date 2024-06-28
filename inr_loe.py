@@ -12,7 +12,7 @@ import torch.nn as nn
 from sklearn.metrics import precision_score, recall_score
 
 import wandb
-from datasets import CelebADataset, ShapeNet
+from datasets import CelebADataset, ShapeNet, CelebAHQ
 from stage1.model import INRLoe
 from stage1.utils import compute_latents, compute_loss, render
 
@@ -36,9 +36,9 @@ if __name__ == '__main__':
     parser.add_argument('--random_scale', action='store_true')
 
     # train params
-    parser.add_argument('--epochs', type=int, default=600)
-    parser.add_argument('--epochs_render', type=int, default=5)
-    parser.add_argument('--epochs_save', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=801)
+    parser.add_argument('--epochs_render', type=int, default=25)
+    parser.add_argument('--epochs_save', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--min_lr', type=float, default=0, help='min learning rate')
     parser.add_argument('--lr_inner', type=float, default=1, help='learning rate for inner loop')
@@ -59,6 +59,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim of each expert')
     parser.add_argument('--std_latent', type=float, default=0.0001, help='std of latent sampling')
     parser.add_argument('--gate_type', type=str, default='separate', help='gating type: separate, conditional, or shared')
+    parser.add_argument('--use_meta_sgd', action='store_true', help='use meta sgd for training')
+    parser.add_argument('--outermost_linear', action='store_true', help='use outermost linear layer')
 
     # latent configs
     parser.add_argument('--compute_latents', action='store_true', help='compute latents for stage 2')
@@ -97,12 +99,18 @@ if __name__ == '__main__':
 
     if args.dataset == 'celeba':
         input_dim, output_dim = 2, 3
-        trainset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
-                                downsampled_size=(args.side_length, args.side_length))
-        train_testset = CelebADataset(root=args.root_dir, split='train', subset=args.render_subset,
-                                downsampled_size=(args.side_length, args.side_length))
-        testset = CelebADataset(root=args.root_dir, split='test', subset=args.render_subset,
-                                downsampled_size=(args.side_length, args.side_length))
+        # trainset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
+        #                         downsampled_size=(args.side_length, args.side_length))
+        # train_testset = CelebADataset(root=args.root_dir, split='train', subset=args.render_subset,
+        #                         downsampled_size=(args.side_length, args.side_length))
+        # testset = CelebADataset(root=args.root_dir, split='test', subset=args.render_subset,
+        #                         downsampled_size=(args.side_length, args.side_length))
+        trainset = CelebAHQ(root=args.root_dir, split='train', subset=args.train_subset,
+                            downsampled_size=(args.side_length, args.side_length))
+        train_testset = CelebAHQ(root=args.root_dir, split='train', subset=args.render_subset,
+                            downsampled_size=(args.side_length, args.side_length))
+        testset = CelebAHQ(root=args.root_dir, split='test', subset=args.render_subset,
+                            downsampled_size=(args.side_length, args.side_length))
     elif args.dataset == 'shapenet':
         input_dim, output_dim = 3, 1
         trainset = ShapeNet(root=args.root_dir, split='train', sampling=args.sampling, 
@@ -128,6 +136,8 @@ if __name__ == '__main__':
         ks=args.ks,
         latent_size=args.latent_size,
         gate_type=args.gate_type,
+        use_meta_sgd=args.use_meta_sgd,
+        outermost_linear=args.outermost_linear
     ).cuda()
 
     # count the number of parameters
@@ -204,6 +214,9 @@ if __name__ == '__main__':
             elif args.dataset == 'shapenet':
                 y = img
 
+            # meta_sgd
+            if args.use_meta_sgd:
+                meta_sgd_inner = inr_loe.meta_sgd_lrs()
             # Inner loop: latents update
             for _ in range(args.inner_steps):
                 out, gates, importance, _ = inr_loe(latents, coords, args.top_k,
@@ -212,12 +225,16 @@ if __name__ == '__main__':
                                        args.top_k, args.cv_loss, args.std_loss)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
-                latents = latents - args.lr_inner * latent_gradients
+                
+                if args.use_meta_sgd:
+                    latents = latents - args.lr_inner * (meta_sgd_inner * latent_gradients)
+                else:
+                    latents = latents - args.lr_inner * latent_gradients
 
             # Update the shared weights
             out, gates, importance, _ = inr_loe(latents, coords, args.top_k,
                                             blend_alphas=blend_alphas)
-            loss, mse = compute_loss(args, epoch, out, y, criterion, gates, importance,
+            loss, psnr = compute_loss(args, epoch, out, y, criterion, gates, importance,
                                      args.top_k, args.cv_loss, args.std_loss)
             task_grad = torch.autograd.grad(loss, inr_loe.get_parameters())
 
@@ -232,8 +249,7 @@ if __name__ == '__main__':
             nn.utils.clip_grad_norm_(inr_loe.get_parameters(), max_norm=args.grad_clip)
             optim_net.step()
 
-            # compute psnr
-            psnr = 10 * np.log10(1 / mse.item())  # shape is N_imgs
+            # update psnr
             psnr_epoch += psnr
 
             # compute acc for voxel
@@ -247,13 +263,21 @@ if __name__ == '__main__':
                 rec_epoch += rec
 
             if i % 25 == 0:
-                logging.info(
-                    "Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
-                        epoch, i, loss.item(), psnr, acc, rec
-                    )
+                # logging
+                logging_str = "Epoch: {}, Iteration: {}, Loss: {:.4f}, PSNR: {:.4f}".format(
+                    epoch, i, loss.item(), psnr
                 )
+                if args.dataset == 'shapenet':
+                    logging_str += ", Acc: {:.4f}, Recall: {:.4f}".format(acc, rec)
+                if args.use_meta_sgd:
+                    logging_str += ", LR_mean: {:.8f}".format(float(torch.abs(meta_sgd_inner).mean()))
+                logging.info(logging_str)
+
+                # wandb logging
                 if args.wandb:
                     wandb.log({"loss": loss.item(), "psnr": psnr, "acc": acc, "rec": rec})
+                    if args.use_meta_sgd:
+                        wandb.log({"lr_mean": float(torch.abs(meta_sgd_inner).mean())})
         scheduler.step()
 
         # Render the images
@@ -265,10 +289,15 @@ if __name__ == '__main__':
         psnr_epoch /= len(dataloader)
         acc_epoch /= len(dataloader)
         rec_epoch /= len(dataloader)
-        logging.info(
-            "Epoch: {}, PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(epoch, psnr_epoch, acc_epoch, rec_epoch)
-        )
+
+        logging_str = "Epoch: {}, PSNR: {:.4f}".format(epoch, psnr_epoch)
+        if args.dataset == 'shapenet':
+            logging_str += ", Acc: {:.4f}, Recall: {:.4f}".format(acc_epoch, rec_epoch)
+        if args.use_meta_sgd:
+            logging_str += ", LR_mean: {:.8f}".format(float(torch.abs(meta_sgd_inner).mean()))
+        logging.info(logging_str)
         logging.info("Saving last model at epoch {}...".format(epoch))
+
         if not os.path.exists(os.path.join(args.save, "ckpt")):
             os.makedirs(os.path.join(args.save, "ckpt"))
         torch.save(inr_loe.state_dict(), os.path.join(args.save, "ckpt", "inr_loe_last.pt"))

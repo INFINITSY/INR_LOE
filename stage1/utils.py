@@ -62,7 +62,14 @@ def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, to
 
         loss = mse + cv_loss_w * cv_loss + std_loss_w * std_loss + cov_loss_w * cov_loss
 
-    return loss, mse.detach()
+    if args.dataset == "celeba":
+        # need to scale mse
+        mse = criterion((out.detach() + 1) / 2, (y.detach() + 1) / 2)
+    else:
+        mse = mse.detach()
+    psnr = 10 * np.log10(1 / mse.item())
+
+    return loss, psnr
 
 
 def off_diagonal(x):
@@ -254,26 +261,22 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     elif args.dataset == "shapenet":
         y = img
 
+    # meta_sgd
+    if args.use_meta_sgd:
+        meta_sgd_inner = model.meta_sgd_lrs()
     # Inner loop: latents update
     for _ in range(args.inner_steps):
         out, gates, importance, _ = model(
             latents, coords, args.top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
-        loss, _ = compute_loss(
-            args,
-            epoch,
-            out,
-            y,
-            criterion,
-            gates,
-            importance,
-            args.top_k,
-            args.cv_loss,
-            args.std_loss,
-        )
+        loss, _ = compute_loss(args, epoch, out, y, criterion, gates,
+                               importance, args.top_k, args.cv_loss, args.std_loss)
         latent_gradients = torch.autograd.grad(loss, latents)[0]
 
-        latents = latents - lr_inner_render * latent_gradients
+        if args.use_meta_sgd:
+            latents = latents - lr_inner_render * (meta_sgd_inner * latent_gradients)
+        else:
+            latents = latents - lr_inner_render * latent_gradients
 
     with torch.no_grad():
         out, gates, _, means = model(
@@ -288,6 +291,8 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     if args.dataset == "celeba":
         out = out.reshape(N, args.side_length, args.side_length, -1)
         out = out.permute(0, 3, 1, 2)
+        # from -1, 1 to 0, 1
+        out = (out + 1) / 2
         out = torch.clamp(out, 0, 1)
         grid_samples = torchvision.utils.make_grid(out, nrow=int(math.sqrt(N)))
         torchvision.utils.save_image(
@@ -419,6 +424,9 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         elif args.dataset == "shapenet":
             y = img
 
+        # meta_sgd
+        if args.use_meta_sgd:
+            meta_sgd_inner = model.meta_sgd_lrs()
         # inner loop for latents update
         for _ in range(args.inner_steps):
             out, gates, importance, _ = model(latents, coords, args.top_k,
@@ -428,14 +436,18 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
             latent_gradients = \
                     torch.autograd.grad(loss, latents)[0]
             
-            latents = latents - lr_inner_render * latent_gradients
+            if args.use_meta_sgd:
+                latents = latents - lr_inner_render * (meta_sgd_inner * latent_gradients)
+            else:
+                latents = latents - lr_inner_render * latent_gradients
 
         with torch.no_grad():
             out, gates, importance, means = model(latents, coords, args.top_k,
                                               blend_alphas=blend_alphas)
-        _, mse = compute_loss(args, epoch, out, y, criterion, gates, importance, 
+        _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, 
                               args.top_k, args.cv_loss, args.std_loss)
-        psnr += 10 * np.log10(1 / mse.item())
+        
+        psnr += psnr_iter
         if args.dataset == 'shapenet':
             pred = out >= 0.5
             acc += pred.float().eq(y).float().mean()

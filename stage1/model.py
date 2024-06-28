@@ -1,4 +1,5 @@
 import math
+from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -208,6 +209,43 @@ class SeparateGateModule(nn.Module):
         return torch.cat(gates, dim=1)  # N_imgs x sum(num_exps)
 
 
+# adapted from mNIF
+class MetaSGDLrs(nn.Module):
+    """Module storing learning rates for meta-SGD.
+
+    Notes:
+    This module does not apply any transformation but simply stores the learning
+    rates. Since we also learn the learning rates we treat them the same as
+    model params.
+    """
+
+    def __init__(self,
+               size_lrs: int,
+               lrs_init_range: Tuple[float, float] = (0.005, 0.1),
+               lrs_clip_range: Tuple[float, float] = (-5., 5.)):
+
+        """Constructor.
+
+        Args:
+        size_lrs: Size of the learning rates to be learned.
+        lrs_init_range: Range from which initial learning rates will be
+            uniformly sampled.
+        lrs_clip_range: Range at which to clip learning rates. Default value will
+            effectively avoid any clipping, but typically learning rates should
+            be positive and small.
+        """
+        super().__init__()
+        self.size_lrs = size_lrs
+        self.lrs_init_range = lrs_init_range
+        self.lrs_clip_range = lrs_clip_range
+        # Initialize learning rates
+        self.meta_sgd_lrs = torch.nn.Parameter(torch.zeros(self.size_lrs).uniform_(self.lrs_init_range[0], self.lrs_init_range[1]),requires_grad=True)
+
+    def forward(self, step=0):
+        # Clip learning rate values
+        return self.meta_sgd_lrs.clamp(self.lrs_clip_range[0], self.lrs_clip_range[1])
+    
+
 class INRLoe(nn.Module):
     def __init__(
         self,
@@ -221,6 +259,10 @@ class INRLoe(nn.Module):
         gate_type="separate",
         noisy_gating=False,
         noise_module=None,
+        outermost_linear=False,
+        use_meta_sgd: bool = False,
+        meta_sgd_init_range: Tuple[float, float] = (0.005, 0.1),
+        meta_sgd_clip_range: Tuple[float, float] = (0., 1.),
     ):
         super(INRLoe, self).__init__()
         self.hidden_dim = hidden_dim
@@ -233,6 +275,20 @@ class INRLoe(nn.Module):
         self.ks = ks
         self.noisy_gating = noisy_gating
         self.gate_type = gate_type
+        self.outermost_linear = outermost_linear
+
+        self.use_meta_sgd = use_meta_sgd
+        self.meta_sgd_init_range = meta_sgd_init_range
+        self.meta_sgd_clip_range = meta_sgd_clip_range
+        # Initialize meta-SGD learning rates
+        if self.use_meta_sgd:
+            if self.gate_type == "shared":
+                meta_lr_size = latent_size
+            elif self.gate_type in ["conditional", "separate"]:
+                meta_lr_size = (len(num_exps), latent_size)
+            self.meta_sgd_lrs = MetaSGDLrs(meta_lr_size,
+                                           self.meta_sgd_init_range,
+                                           self.meta_sgd_clip_range)
 
         if self.noisy_gating and noise_module is not None:
             self.noise_generator = noise_module(output_size=sum(self.num_exps))
@@ -248,7 +304,12 @@ class INRLoe(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim * self.num_exps[i + 1]), self.nl
                 )
             )
-        self.net_param.append(nn.Linear(hidden_dim, output_dim * self.num_exps[-1]))
+        if self.outermost_linear:
+            self.net_param.append(
+                nn.Sequential(nn.Linear(hidden_dim, output_dim * self.num_exps[-1], self.nl))
+            )
+        else:
+            self.net_param.append(nn.Linear(hidden_dim, output_dim * self.num_exps[-1]))
         self.net_param = nn.Sequential(*self.net_param)
         # self.net.apply(init_weights_relu)
         self.net_param.apply(sine_init)
@@ -264,7 +325,12 @@ class INRLoe(nn.Module):
             self.net.append(
                 MetaSequential(BatchLinear(hidden_dim, hidden_dim), self.nl)
             )
-        self.net.append(BatchLinear(hidden_dim, output_dim))
+        if self.outermost_linear:
+            self.net.append(
+                MetaSequential(BatchLinear(hidden_dim, output_dim, self.nl))
+            )
+        else:
+            self.net.append(BatchLinear(hidden_dim, output_dim))
         self.net = MetaSequential(*self.net)
         self.net.apply(sine_init)
         self.net[0].apply(first_layer_sine_init)
@@ -388,13 +454,16 @@ class INRLoe(nn.Module):
         #     x = module(x, params=self.net.get_subdict(params, name))
         #     activations.append(x)
 
-        x = torch.sigmoid(x)
+        # x = torch.sigmoid(x)
 
         return x, gates, importance, means #, activations
 
     def get_parameters(self):
         # return both the parameters of the network and the gate module
-        return list(self.net_param.parameters()) + list(self.gate_module.parameters())
+        params = list(self.net_param.parameters()) + list(self.gate_module.parameters())
+        if self.use_meta_sgd:
+            params += list(self.meta_sgd_lrs.parameters())
+        return params
 
 
 class VAE(nn.Module):
