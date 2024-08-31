@@ -1,0 +1,10 @@
+**/__pycache__/
+save/
+others/
+data/
+.vscode/
+wandb/
+tmp/
+
+*.ipynb
+.flake8

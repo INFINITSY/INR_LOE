@@ -13,7 +13,7 @@ from sklearn.metrics import precision_score, recall_score
 
 import wandb
 from datasets import CelebADataset, ShapeNet, CelebAHQ
-from stage1.model import INRLoe
+from stage1.model import INRLoe, NoiseCombiner
 from stage1.utils import compute_latents, compute_loss, render
 
 if __name__ == '__main__':
@@ -27,7 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=14)
     parser.add_argument('--train_subset', type=int, default=-1)
     parser.add_argument('--render_subset', type=int, default=9)
-    
+
     # CelebA configs
     parser.add_argument('--side_length', type=int, default=64)
 
@@ -37,31 +37,37 @@ if __name__ == '__main__':
 
     # train params
     parser.add_argument('--epochs', type=int, default=801)
-    parser.add_argument('--epochs_render', type=int, default=25)
+    parser.add_argument('--epochs_render', type=int, default=5)
     parser.add_argument('--epochs_save', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--min_lr', type=float, default=0, help='min learning rate')
     parser.add_argument('--lr_inner', type=float, default=1, help='learning rate for inner loop')
-    parser.add_argument('--cv_loss', type=float, default=0, help='weight for cv loss')
-    parser.add_argument('--std_loss', type=float, default=0, help='weight for std loss')
-    parser.add_argument('--cov_loss', type=float, default=0, help='weight for cov loss')
-    parser.add_argument('--inner_steps', type=int, default=3, help='number of inner steps for each coords')
+    parser.add_argument('--inner_steps', type=int, default=7, help='number of inner steps for each coords')
     parser.add_argument('--grad_clip', type=float, default=1, help='gradient clipping')
+    parser.add_argument('--cv_loss_w', type=float, default=0, help='weight for cv loss')
+    parser.add_argument('--std_loss_w', type=float, default=0, help='weight for std loss')
+    parser.add_argument('--cov_loss_w', type=float, default=0, help='weight for cov loss')
+    parser.add_argument('--ort_loss_w', type=float, default=0, help='weight exps orthogonal regularization loss')
+    parser.add_argument('--sparse_loss_w', type=float, default=0, help='weight for sparse loss')
+    parser.add_argument('--warmup_epochs', type=int, default=0, help='number of warmup epochs for top k')
 
     # model configs
     parser.add_argument('--top_k', action='store_true', help='whether to use top k sparce gates')
     parser.add_argument('--num_exps', nargs='+', type=int, default=[64, 64, 64, 64, 64])
-    parser.add_argument('--ks', nargs='+', type=int, default=[8, 8, 8, 8, 8])
+    parser.add_argument('--ks', nargs='+', type=int, default=[32, 32, 32, 32, 32])
     parser.add_argument('--progressive_epoch', type=int, default=None, help='progressively enable experts for each layer')
     parser.add_argument('--progressive_reverse', action='store_true', help='reverse the progressive enablement')
     parser.add_argument('--latent_size', type=int, default=64, help='size of the latent for each layer')
     parser.add_argument('--num_hidden', type=int, default=4, help='number of hidden layers')
     parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim of each expert')
     parser.add_argument('--std_latent', type=float, default=0.0001, help='std of latent sampling')
-    parser.add_argument('--gate_type', type=str, default='separate', help='gating type: separate, conditional, or shared')
+    parser.add_argument('--gate_type', type=str, default='conditional', help='gating type: separate, conditional, shared, or direct')
+    parser.add_argument('--cond_scale', type=float, default=1.0, help='scale for conditional gating')
+    parser.add_argument('--learnable_s', action='store_true', help='use learnable s for gating')
     parser.add_argument('--use_meta_sgd', action='store_true', help='use meta sgd for training')
     parser.add_argument('--outermost_linear', action='store_true', help='use outermost linear layer')
-
+    parser.add_argument('--use_noise_input', action='store_true', help='use noise input at each layer')
+    
     # latent configs
     parser.add_argument('--compute_latents', action='store_true', help='compute latents for stage 2')
     
@@ -122,7 +128,7 @@ if __name__ == '__main__':
     else:
         raise ValueError("Invalid dataset")
 
-    dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=(not args.compute_latents), num_workers=4)
+    dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=(not args.compute_latents), num_workers=2)
     train_testloader = torch.utils.data.DataLoader(train_testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
@@ -136,8 +142,11 @@ if __name__ == '__main__':
         ks=args.ks,
         latent_size=args.latent_size,
         gate_type=args.gate_type,
+        cond_scale=args.cond_scale,
+        learnable_s=args.learnable_s,
         use_meta_sgd=args.use_meta_sgd,
-        outermost_linear=args.outermost_linear
+        outermost_linear=args.outermost_linear,
+        use_noise_input=args.use_noise_input
     ).cuda()
 
     # count the number of parameters
@@ -146,7 +155,8 @@ if __name__ == '__main__':
     logging.info("Model size is: {:.2f} MB".format(params * 4 / 1024**2))
 
     # create the optimizer and scheduler
-    optim_net = torch.optim.Adam(inr_loe.get_parameters(), lr=args.lr, weight_decay=1e-5)
+    # optim_net = torch.optim.Adam(inr_loe.get_parameters(), lr=args.lr, weight_decay=1e-5)
+    optim_net = torch.optim.AdamW(inr_loe.get_parameters(), lr=args.lr, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim_net, T_max=args.epochs, eta_min=args.min_lr)
     criterion = nn.MSELoss()
 
@@ -175,6 +185,7 @@ if __name__ == '__main__':
 
     for epoch in range(start_epoch, args.epochs):
         inr_loe.train()
+        top_k = args.top_k and epoch >= args.warmup_epochs
 
         # if progressive_epoch is not None, gradually enable the experts for each layer
         if args.progressive_epoch is not None:
@@ -200,6 +211,10 @@ if __name__ == '__main__':
                 latents = torch.randn(img.size(0), len(args.num_exps), args.latent_size).cuda() * args.std_latent
             elif args.gate_type == 'shared':
                 latents = torch.randn(img.size(0), args.latent_size).cuda() * args.std_latent
+            elif args.gate_type == 'direct':
+                # initialize around 1/latent_size
+                latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size + \
+                            torch.randn(img.size(0), len(args.num_exps), args.latent_size).cuda() * args.std_latent
             else:
                 raise ValueError("Invalid gate type")
             latents.requires_grad = True
@@ -218,11 +233,10 @@ if __name__ == '__main__':
             if args.use_meta_sgd:
                 meta_sgd_inner = inr_loe.meta_sgd_lrs()
             # Inner loop: latents update
-            for _ in range(args.inner_steps):
-                out, gates, importance, _ = inr_loe(latents, coords, args.top_k,
-                                                blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
-                loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance,
-                                       args.top_k, args.cv_loss, args.std_loss)
+            for step in range(args.inner_steps):
+                out, gates, importance, _ = inr_loe(latents, coords, top_k,
+                                                blend_alphas=blend_alphas, step=step) # N_imgs x N_coords x out_dim
+                loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
                 
@@ -232,10 +246,14 @@ if __name__ == '__main__':
                     latents = latents - args.lr_inner * latent_gradients
 
             # Update the shared weights
-            out, gates, importance, _ = inr_loe(latents, coords, args.top_k,
+            out, gates, importance, means = inr_loe(latents, coords, top_k,
                                             blend_alphas=blend_alphas)
-            loss, psnr = compute_loss(args, epoch, out, y, criterion, gates, importance,
-                                     args.top_k, args.cv_loss, args.std_loss)
+            loss, psnr = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
+            if args.ort_loss_w > 0:
+                exps_sim = inr_loe.compute_exps_sim()
+                ort_loss = torch.mean(exps_sim)
+                loss += args.ort_loss_w * ort_loss
+
             task_grad = torch.autograd.grad(loss, inr_loe.get_parameters())
 
             # Add to meta-gradient
@@ -271,13 +289,50 @@ if __name__ == '__main__':
                     logging_str += ", Acc: {:.4f}, Recall: {:.4f}".format(acc, rec)
                 if args.use_meta_sgd:
                     logging_str += ", LR_mean: {:.8f}".format(float(torch.abs(meta_sgd_inner).mean()))
+                if args.learnable_s:
+                    logging_str += ", cond_s: {:.4f}".format(inr_loe.gate_module.s.item())
+                # compute mean abs of latents and means per layer
+                for l in range(latents.size(1)):
+                    if l == 0:
+                        logging_str += ", l_{}: {:.4f}".format(l, latents[:, l].abs().mean().item())
+                    else:
+                        logging_str += ", l_{}: {:.4f}/{:.4f}".format(
+                            l, 
+                            latents[:, l].abs().mean().item(),
+                            means[l-1].abs().mean().item())
+                if args.ort_loss_w > 0:
+                    logging_str += ", ort_loss: {:.4f}".format(ort_loss.item())
                 logging.info(logging_str)
 
                 # wandb logging
                 if args.wandb:
                     wandb.log({"loss": loss.item(), "psnr": psnr, "acc": acc, "rec": rec})
+                    log = {}
                     if args.use_meta_sgd:
-                        wandb.log({"lr_mean": float(torch.abs(meta_sgd_inner).mean())})
+                        # wandb.log({"lr_mean": float(torch.abs(meta_sgd_inner).mean())})
+                        log["lr_mean"] = float(torch.abs(meta_sgd_inner).mean())
+                    if args.learnable_s:
+                        # wandb.log({"cond_s": inr_loe.gate_module.s.item()})
+                        log["cond_s"] = inr_loe.gate_module.s.item()
+                    for l in range(latents.size(1)):
+                        # wandb.log({"latent_{}_abs_mean".format(l): latents[:, l].abs().mean().item()})
+                        log["latent_{}_abs_mean".format(l)] = latents[:, l].abs().mean().item()
+                    for l in range(len(means)):
+                        # wandb.log({"means_{}_abs_mean".format(l+1): means[l].abs().mean().item()})
+                        log["means_{}_abs_mean".format(l+1)] = means[l].abs().mean().item()
+                    if args.use_noise_input:
+                        for name, module in inr_loe.net.named_modules():
+                            if isinstance(module, NoiseCombiner):
+                                log["{}_abs_mean".format(name)] = \
+                                    module.noise_scale.abs().mean().item()
+                    if args.ort_loss_w > 0:
+                        # wandb.log({"ort_loss": ort_loss.item()})
+                        log["ort_loss"] = ort_loss.item()
+                        for l in range(len(exps_sim)):
+                            # wandb.log({"exps_sim_{}".format(l): exps_sim[l].item()})
+                            log["exps_sim_{}".format(l)] = exps_sim[l].item()
+                    if log != {}:
+                        wandb.log(log)
         scheduler.step()
 
         # Render the images
@@ -295,6 +350,8 @@ if __name__ == '__main__':
             logging_str += ", Acc: {:.4f}, Recall: {:.4f}".format(acc_epoch, rec_epoch)
         if args.use_meta_sgd:
             logging_str += ", LR_mean: {:.8f}".format(float(torch.abs(meta_sgd_inner).mean()))
+        if args.learnable_s:
+            logging_str += ", cond_s: {:.4f}".format(inr_loe.gate_module.s.item())
         logging.info(logging_str)
         logging.info("Saving last model at epoch {}...".format(epoch))
 

@@ -21,46 +21,82 @@ def get_mgrid(sidelen, dim=2, max=1.0):
     return mgrid
 
 
-def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False, 
-                 cv_loss_w=0, std_loss_w=0, cov_loss_w=0):
+def get_load(gate):
+    """Compute the true load per expert, given the gates.
+    The load is the number of examples for which the corresponding gate is >0.
+    Args:
+    gates: a `Tensor` of shape [batch_size, n]
+    Returns:
+    a float32 `Tensor` of shape [n]
+    """
+    return (gate > 0).sum(0)
+
+
+def get_sparsity(gate, l1_exp=1.0):
+    # L1 penalty on the gates encourages sparsity
+    weights = 1. / torch.pow(torch.full((gate.shape[-1],), l1_exp, device=gate.device), \
+                torch.arange(gate.shape[-1], device=gate.device))
+    sparsity = torch.mean(torch.abs(gate) * weights[None, ...])
+    return sparsity
+
+
+def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False):
+    # base mse loss
     mse = criterion(out, y)
-    if top_k:
-        loss = mse
-    else:
-        if importance is not None:
-            cv_loss = []
-            for l, v in enumerate(importance):
-                cv_loss.append(get_cv_loss(v))
-                if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
-                    # only calculate the cv loss for active layers
-                    break
-            cv_loss = torch.stack(cv_loss).mean()
-        else:
-            cv_loss = 0
+    loss = mse
 
-        if gates is not None:
-            std_loss = []
-            cov_loss = []
-            # gates is a list: num_layers x [N, num_experts]
-            # std_threshold = [0.005, 0.01, 0.05, 0.1, 0.15]
-            std_threshold = [0.01] * len(gates)
-            for l, g in enumerate(gates):
-                # compute the variance accross N samples
-                std_loss.append(get_std_loss(g, threshold=std_threshold[l]))
-                cov_loss.append(get_cov_loss(g))
-                if (
-                    args.progressive_epoch is not None
-                    and l == epoch // args.progressive_epoch
-                ):
-                    # only calculate the var loss for active layers
-                    break
-            std_loss = torch.stack(std_loss).sum()
-            cov_loss = torch.stack(cov_loss).mean()
-        else:
-            std_loss = 0
-            cov_loss = 0
+    # sparsity loss
+    if args.sparse_loss_w > 0 and top_k is False:
+        sparse_loss = []
+        for l, g in enumerate(gates):
+            # compute the sparse loss
+            sparse_loss.append(get_sparsity(g))
+            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                # only calculate the sparse loss for active layers
+                break
+        sparse_loss = torch.stack(sparse_loss).mean()
+        loss += args.sparse_loss_w * sparse_loss
 
-        loss = mse + cv_loss_w * cv_loss + std_loss_w * std_loss + cov_loss_w * cov_loss
+    # cv loss
+    if args.cv_loss_w > 0:
+        cv_loss_imp = []
+        cv_loss_load = []
+        for l, imp in enumerate(importance):
+            cv_loss_imp.append(get_cv_loss(imp))
+            if top_k:
+                load = get_load(gates[l])
+                cv_loss_load.append(get_cv_loss(load))
+            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                # only calculate the cv loss for active layers
+                break
+        cv_loss_imp = torch.stack(cv_loss_imp).mean()
+        cv_loss_load = torch.stack(cv_loss_load).mean() if top_k else 0
+        loss += args.cv_loss_w * (cv_loss_imp + cv_loss_load)
+
+    if args.std_loss_w > 0:
+        std_loss = []
+        # gates is a list: num_layers x [N, num_experts]
+        # std_threshold = [0.005, 0.01, 0.05, 0.1, 0.15]
+        std_threshold = [0.1] * len(gates)
+        for l, g in enumerate(gates):
+            # compute the variance accross N samples
+            std_loss.append(get_std_loss(g, threshold=std_threshold[l]))
+            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                # only calculate the var loss for active layers
+                break
+        std_loss = torch.stack(std_loss).sum()
+        loss += args.std_loss_w * std_loss
+        # cov_loss = torch.stack(cov_loss).mean()
+
+    if args.cov_loss_w > 0:
+        cov_loss = []
+        for l, g in enumerate(gates):
+            cov_loss.append(get_cov_loss(g))
+            if args.progressive_epoch is not None and l == epoch // args.progressive_epoch:
+                # only calculate the cov loss for active layers
+                break
+        cov_loss = torch.stack(cov_loss).mean()
+        loss += args.cov_loss_w * cov_loss
 
     if args.dataset == "celeba":
         # need to scale mse
@@ -82,7 +118,8 @@ def get_cov_loss(x):
     """
     Encourage the off-diagonal elements of the covariance matrix to be small"""
     N, C = x.shape
-    cov_x = (x.T @ x) / (N - 1)
+    x_norm = F.normalize(x, p=2, dim=1)
+    cov_x = (x_norm.T @ x_norm) / (N - 1)
     return off_diagonal(cov_x).pow_(2).sum().div(C)
 
 
@@ -90,7 +127,9 @@ def get_std_loss(x, eps=1e-6, threshold=1e-1):
     """
     Encourage the std of the gate to be larger than a threshold
     """
-    std_x = torch.sqrt(x.var(dim=0) + eps)
+    # first apply normalization to each row
+    x_norm = F.normalize(x, p=2, dim=1)
+    std_x = torch.sqrt(x_norm.var(dim=0) + eps)
     return torch.mean(F.relu(threshold - std_x))
 
 
@@ -157,10 +196,11 @@ def render_interp_condition(args, epoch, model, latents, blend_alphas, num_steps
     )  # [layers * (num_steps+1), layers, latent_size]
 
     model.eval()
+    top_k = args.top_k and epoch >= args.warmup_epochs
     with torch.no_grad():
         coords = get_mgrid(args.side_length).cuda()
         out, _, _, _ = model(
-            grid_latents, coords, args.top_k, blend_alphas=blend_alphas
+            grid_latents, coords, top_k, blend_alphas=blend_alphas
         )
     out = out.reshape(-1, args.side_length, args.side_length, 3)
     out = out.permute(0, 3, 1, 2)
@@ -193,10 +233,11 @@ def render_interp(args, epoch, model, latents, blend_alphas, num_steps=10):
 
     # render the images
     model.eval()
+    top_k = args.top_k and epoch >= args.warmup_epochs
     with torch.no_grad():
         coords = get_mgrid(args.side_length).cuda()
         out, _, _, _ = model(
-            grid_latents, coords, args.top_k, blend_alphas=blend_alphas
+            grid_latents, coords, top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
 
     out = out.reshape(-1, args.side_length, args.side_length, 3)
@@ -216,11 +257,12 @@ def render_sample(args, epoch, model, blend_alphas):
     Sample from the model and render the images
     """
     model.eval()
+    top_k = args.top_k and epoch >= args.warmup_epochs
     with torch.no_grad():
         coords = get_mgrid(args.side_length).cuda()
         latents = torch.randn(16, args.latent_size).cuda() * args.std_latent
         out, _, _, _ = model(
-            latents, coords, args.top_k, blend_alphas=blend_alphas
+            latents, coords, top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
     out = out.reshape(-1, args.side_length, args.side_length, 3)
     out = out.permute(0, 3, 1, 2)
@@ -249,6 +291,9 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
         latents = torch.zeros(img.size(0), len(args.num_exps), args.latent_size).cuda()
     elif args.gate_type == "shared":
         latents = torch.zeros(img.size(0), args.latent_size).cuda()
+    elif args.gate_type == 'direct':
+        # initialize at 1/latent_size
+        latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size
     else:
         raise ValueError("Invalid gate type")
     latents.requires_grad = True
@@ -264,13 +309,16 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     # meta_sgd
     if args.use_meta_sgd:
         meta_sgd_inner = model.meta_sgd_lrs()
+
+    # determine if to use top_k
+    top_k = args.top_k and epoch >= args.warmup_epochs
+
     # Inner loop: latents update
-    for _ in range(args.inner_steps):
+    for step in range(args.inner_steps):
         out, gates, importance, _ = model(
-            latents, coords, args.top_k, blend_alphas=blend_alphas
+            latents, coords, top_k, blend_alphas=blend_alphas, step=step
         )  # N_imgs x N_coords x out_dim
-        loss, _ = compute_loss(args, epoch, out, y, criterion, gates,
-                               importance, args.top_k, args.cv_loss, args.std_loss)
+        loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
         latent_gradients = torch.autograd.grad(loss, latents)[0]
 
         if args.use_meta_sgd:
@@ -280,7 +328,7 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
 
     with torch.no_grad():
         out, gates, _, means = model(
-            latents, coords, args.top_k, blend_alphas=blend_alphas
+            latents, coords, top_k, blend_alphas=blend_alphas
         )
 
     mode = "test" if test else "train"
@@ -354,7 +402,11 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
         cbar.set_ticks([min_val, max_val])
         # write title to be the mean std
         std_gate = gate.std(axis=0).mean()
-        axes[j].set_title("std: {:.4f}".format(std_gate))
+        # normalize the gate and compute std
+        gate_norm = gate / np.linalg.norm(gate, axis=1, keepdims=True)
+        # gate_norm = gate - gate.mean(axis=0)
+        std_gate_norm = gate_norm.std(axis=0).mean()
+        axes[j].set_title("std: {:.4f} | std_norm: {:.4f}".format(std_gate, std_gate_norm))
     plt.subplots_adjust(wspace=0.4)
     plt.tight_layout()
     plt.savefig(
@@ -412,6 +464,9 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
             ).cuda()
         elif args.gate_type == "shared":
             latents = torch.zeros(img.size(0), args.latent_size).cuda()
+        elif args.gate_type == 'direct':
+            # initialize at 1/latent_size
+            latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size
         else:
             raise ValueError("Invalid gate type")
         latents.requires_grad = True
@@ -427,12 +482,15 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         # meta_sgd
         if args.use_meta_sgd:
             meta_sgd_inner = model.meta_sgd_lrs()
+
+        # determine if to use top_k
+        top_k = args.top_k and epoch >= args.warmup_epochs
+
         # inner loop for latents update
-        for _ in range(args.inner_steps):
-            out, gates, importance, _ = model(latents, coords, args.top_k,
-                                            blend_alphas=blend_alphas)
-            loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance,
-                                   args.top_k, args.cv_loss, args.std_loss)
+        for step in range(args.inner_steps):
+            out, gates, importance, _ = model(latents, coords, top_k,
+                                            blend_alphas=blend_alphas, step=step)
+            loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
             latent_gradients = \
                     torch.autograd.grad(loss, latents)[0]
             
@@ -442,10 +500,9 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
                 latents = latents - lr_inner_render * latent_gradients
 
         with torch.no_grad():
-            out, gates, importance, means = model(latents, coords, args.top_k,
+            out, gates, importance, means = model(latents, coords, top_k,
                                               blend_alphas=blend_alphas)
-        _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, 
-                              args.top_k, args.cv_loss, args.std_loss)
+        _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
         
         psnr += psnr_iter
         if args.dataset == 'shapenet':

@@ -184,7 +184,7 @@ class CelebAHQ(torch.utils.data.Dataset):
             # bottom = (height + s) / 2
             # img = img.crop((left, top, right, bottom))
             img = img.resize(self.downsampled_size, resample=Image.BICUBIC)
-        
+
         img = np.asarray(img).astype(np.float32) / 255.0
         # to -1, 1
         img = 2 * img - 1
@@ -196,7 +196,7 @@ class CelebAHQ(torch.utils.data.Dataset):
         gt_dict = {"img": torch.from_numpy(img)}
 
         return in_dict, gt_dict
-    
+
 
 class CIFAR10Dataset(torch.utils.data.Dataset):
 
