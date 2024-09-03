@@ -138,34 +138,32 @@ class MoECombiner(torch_geometric.nn.conv.MessagePassing):
 
 
 class ConditionalGateModule(nn.Module):
-    def __init__(self, latent_size, num_exps=[64, 64, 64, 64], s=1.0, learnable_s=False):
+    def __init__(self, latent_size, num_exps=[64, 64, 64, 64], s=1.0, npatch=1):
         super().__init__()
         self.num_exps = num_exps
         self.s = s
-        self.learnable_s = learnable_s
-        if self.learnable_s:
-            self.s = nn.Parameter(torch.tensor(s), requires_grad=True)
+        self.npatch = npatch
         self.gate_module = nn.ModuleList()
         self.mean_module = nn.ModuleList()
         # output gating vector for each layer plus mean and std for subsequent layer
-        for i in range(len(num_exps) - 1):
+        for i in range(len(num_exps)):
             # self.nets.append(nn.Linear(latent_size, num_exps[i] + 1 * latent_size))
-            gate_in = latent_size if i == 0 else latent_size * 2
+            # gate_in = latent_size if i == 0 else latent_size * 2
+            gate_in = latent_size
+            gate_out = npatch * num_exps[i]
+
             self.gate_module.append(nn.Sequential(
-                nn.Linear(gate_in, num_exps[i]),
+                nn.Linear(gate_in, gate_out),
                 # nn.LeakyReLU(0.1),
                 # nn.Linear(num_exps[i], num_exps[i]),
             ))
-            self.mean_module.append(nn.Sequential(
-                nn.Linear(num_exps[i], num_exps[i]//4),
-                nn.LeakyReLU(0.1),
-                nn.Linear(num_exps[i]//4, latent_size),
-            ))
-        self.gate_module.append(nn.Sequential(
-            nn.Linear(2 * latent_size, num_exps[i]),
-            # nn.LeakyReLU(0.1),
-            # nn.Linear(num_exps[i], num_exps[i]),
-        ))
+            if i < len(num_exps) - 1:
+                # for the next layer
+                self.mean_module.append(nn.Sequential(
+                    nn.Linear(gate_out, gate_out//4),
+                    nn.LeakyReLU(0.1),
+                    nn.Linear(gate_out//4, latent_size),
+                ))
 
         # init output of each layer to be uniform
         for i, net in enumerate(self.gate_module):
@@ -178,6 +176,7 @@ class ConditionalGateModule(nn.Module):
 
     def forward(self, latents, step=None):
         # latents is N_imgs x N_layers x latent_size
+        N = latents.shape[0]
         gates = []
         means = []
         # log_vars = []
@@ -193,17 +192,21 @@ class ConditionalGateModule(nn.Module):
             if i == 0:
                 latents_rprm = latents_i # N_imgs x latent_size
             else:
-                latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
-            gate = net(latents_rprm)  # N_imgs x (num_exps[i] + 2 * latent_size)
-            gates.append(gate)
+                latents_rprm = mean[-1] * latents_i  # N_imgs x latent_size
+                # latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
+            gate = net(latents_rprm) # N_imgs x (npatch * num_exps[i])
             if i < len(self.gate_module) - 1:
                 # for the next layer
                 mean = self.mean_module[i](gate)  # N_imgs x latent_size
                 # scale the mean
                 mean = mean * self.s
                 means.append(mean)
+            gate = gate.view(N * self.npatch, self.num_exps[i]) # (N_imgs * npatch) x num_exps[i]
+            gates.append(gate)
 
-        return torch.cat(gates, dim=1), means
+        gates = torch.cat(gates, dim=-1)  # (N_imgs * npatch) x sum(num_exps)
+
+        return gates, means
 
 
 class SeparateGateModule(nn.Module):
@@ -324,8 +327,6 @@ class INRLoe(nn.Module):
         ks=[4, 4, 32, 32, 256],
         latent_size=64,
         gate_type="separate",
-        cond_scale=1.0,
-        learnable_s=False,
         noisy_gating=False,
         noise_module=None,
         outermost_linear=False,
@@ -333,8 +334,10 @@ class INRLoe(nn.Module):
         meta_sgd_init_range: Tuple[float, float] = (0.005, 0.1),
         meta_sgd_clip_range: Tuple[float, float] = (0., 1.),
         use_noise_input: bool = False,
+        npatch_side: int = 1,
     ):
         super(INRLoe, self).__init__()
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_hidden = num_hidden
@@ -345,8 +348,6 @@ class INRLoe(nn.Module):
         self.ks = ks
         self.noisy_gating = noisy_gating
         self.gate_type = gate_type
-        self.cond_scale = cond_scale
-        self.learnable_s = learnable_s
         self.outermost_linear = outermost_linear
 
         self.use_meta_sgd = use_meta_sgd
@@ -354,6 +355,8 @@ class INRLoe(nn.Module):
         self.meta_sgd_clip_range = meta_sgd_clip_range
 
         self.use_noise_input = use_noise_input
+        self.npatch_side = npatch_side
+        self.npatch = npatch_side ** input_dim
         # Initialize meta-SGD learning rates
         if self.use_meta_sgd:
             if self.gate_type == "shared":
@@ -422,10 +425,12 @@ class INRLoe(nn.Module):
 
         if self.gate_type == "conditional":
             self.gate_module = ConditionalGateModule(
-                latent_size, num_exps=self.num_exps, s=self.cond_scale, learnable_s=self.learnable_s
+                latent_size, num_exps=self.num_exps, npatch=self.npatch
             )
         elif self.gate_type == "separate":
-            self.gate_module = SeparateGateModule(latent_size, num_exps=self.num_exps)
+            self.gate_module = SeparateGateModule(
+                latent_size, num_exps=self.num_exps
+            )
         elif self.gate_type == "shared":
             self.gate_module = nn.Linear(latent_size, output_size)
             for i, num_exp in enumerate(self.num_exps):
@@ -481,8 +486,8 @@ class INRLoe(nn.Module):
         return gates  # , bias, load
 
     def get_combined_weight(self, gates):
-        # gates is a list of len(num_exps) x N_imgs x num_exps[i]
-        # return combined weight of shape N_imgs x (sum(num_exps))
+        # gates is a tuple of len(num_exps) tensors of shape N_imgs x num_exps[i]
+        # return combined weights
 
         params = dict()
         for i, (name, weights_all) in enumerate(self.net_param.named_parameters()):
@@ -507,17 +512,22 @@ class INRLoe(nn.Module):
         return params
 
     def forward(self, latents, coords, top_k=False, blend_alphas=[0, 0, 0, 0, 0], step=None):
+        # coords shape: N_imgs x npatch x N_coords x input_dim
+        # combine the first two dimensions
+        coords = coords.view(-1, coords.shape[-2], coords.shape[-1])
+        # shape of coords: (N_imgs * npatch) x N_coords x input_dim
 
         if self.gate_type == "conditional":
-            raw_gates, means = self.gate_module(latents, step)  # N_imgs x sum(num_exps)
+            raw_gates, means = self.gate_module(latents, step)
         else:
             raw_gates = self.gate_module(latents)
             means = None
+        # shape of raw_gates: (N_imgs * npatch) x sum(num_exps)
 
         # split gates to according to self.num_exps
         gates = torch.split(
-            raw_gates, self.num_exps, dim=1
-        )  # len(num_exps) x N_imgs x num_exps[i]
+            raw_gates, self.num_exps, dim=-1
+        )  # tuple of len(num_exps) tensors of shape (N_imgs * npatch) x num_exps[i]
 
         # to list
         gates = list(gates)
@@ -534,17 +544,35 @@ class INRLoe(nn.Module):
         params = self.get_combined_weight(gates)  # dict of combined weights
 
         x = coords
-        x = self.net(x, params=params)
+        x = self.net(x, params=params) # (N_imgs * npatch) x N_coords x output_dim
 
-        # i also want to return the activation of each layer in self.net
-        # activations = []
-        # for name, module in self.net._modules.items():
-        #     x = module(x, params=self.net.get_subdict(params, name))
-        #     activations.append(x)
+        if self.npatch > 1:
+            x = self.reshape_patch(x)
 
-        # x = torch.sigmoid(x)
+        return x, gates, importance, means
+    
+    def reshape_patch(self, x):
+        # x: (N_imgs * npatch) x N_coords x output_dim
+        N_imgs = x.shape[0] // self.npatch
+        N_coords = x.shape[1]
+        C = x.shape[-1]
+        x = x.view(N_imgs, self.npatch, N_coords, C)
 
-        return x, gates, importance, means #, activations
+        patchlen = int(N_coords ** (1 / self.input_dim)) # length of each side of the patch
+
+        reshape_size = [N_imgs] + [self.npatch_side] * self.input_dim + [patchlen] * self.input_dim + [C]
+        x = x.view(reshape_size)
+        if self.input_dim == 2:
+            # 2D case
+            x = x.permute(0, 1, 3, 2, 4, 5)
+        elif self.input_dim == 3:
+            # 3D case
+            x = x.permute(0, 1, 4, 2, 5, 3, 6, 7)
+        else:
+            raise ValueError(f"Unsupported input_dim: {self.input_dim} in patchwise mode")
+        
+        x = x.reshape(N_imgs, -1, C)
+        return x
 
     def get_parameters(self):
         # return both the parameters of the network and the gate module

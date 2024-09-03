@@ -316,7 +316,7 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     # Inner loop: latents update
     for step in range(args.inner_steps):
         out, gates, importance, _ = model(
-            latents, coords, top_k, blend_alphas=blend_alphas, step=step
+            latents, coords, top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
         loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
         latent_gradients = torch.autograd.grad(loss, latents)[0]
@@ -489,7 +489,7 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         # inner loop for latents update
         for step in range(args.inner_steps):
             out, gates, importance, _ = model(latents, coords, top_k,
-                                            blend_alphas=blend_alphas, step=step)
+                                            blend_alphas=blend_alphas)
             loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
             latent_gradients = \
                     torch.autograd.grad(loss, latents)[0]

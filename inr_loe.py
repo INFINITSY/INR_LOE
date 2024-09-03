@@ -24,9 +24,10 @@ if __name__ == '__main__':
 
     # data loader
     parser.add_argument('--dataset', type=str, default='celeba', help='dataset name')
-    parser.add_argument('--batch_size', type=int, default=14)
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--train_subset', type=int, default=-1)
     parser.add_argument('--render_subset', type=int, default=9)
+    parser.add_argument('--side_patch', type=int, default=1)
 
     # CelebA configs
     parser.add_argument('--side_length', type=int, default=64)
@@ -42,7 +43,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--min_lr', type=float, default=0, help='min learning rate')
     parser.add_argument('--lr_inner', type=float, default=1, help='learning rate for inner loop')
-    parser.add_argument('--inner_steps', type=int, default=7, help='number of inner steps for each coords')
+    parser.add_argument('--inner_steps', type=int, default=3, help='number of inner steps for each coords')
     parser.add_argument('--grad_clip', type=float, default=1, help='gradient clipping')
     parser.add_argument('--cv_loss_w', type=float, default=0, help='weight for cv loss')
     parser.add_argument('--std_loss_w', type=float, default=0, help='weight for std loss')
@@ -67,7 +68,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_meta_sgd', action='store_true', help='use meta sgd for training')
     parser.add_argument('--outermost_linear', action='store_true', help='use outermost linear layer')
     parser.add_argument('--use_noise_input', action='store_true', help='use noise input at each layer')
-    
+
     # latent configs
     parser.add_argument('--compute_latents', action='store_true', help='compute latents for stage 2')
     
@@ -94,29 +95,27 @@ if __name__ == '__main__':
         if arg != 'root_dir':
             logging.info(f"{arg}: {getattr(args, arg)}")
 
-    if args.wandb:
-        wandb.init(project="inr-loe")
-        wandb.config.update(args)
-
     # load all the datasets when computing latents
     if args.compute_latents:
         args.train_subset = -1
         args.render_subset = -1
+        args.wandb = False
+
+    if args.wandb:
+        wandb.init(project="inr-loe")
+        wandb.config.update(args)
 
     if args.dataset == 'celeba':
         input_dim, output_dim = 2, 3
-        # trainset = CelebADataset(root=args.root_dir, split='train', subset=args.train_subset, 
-        #                         downsampled_size=(args.side_length, args.side_length))
-        # train_testset = CelebADataset(root=args.root_dir, split='train', subset=args.render_subset,
-        #                         downsampled_size=(args.side_length, args.side_length))
-        # testset = CelebADataset(root=args.root_dir, split='test', subset=args.render_subset,
-        #                         downsampled_size=(args.side_length, args.side_length))
         trainset = CelebAHQ(root=args.root_dir, split='train', subset=args.train_subset,
-                            downsampled_size=(args.side_length, args.side_length))
+                            downsampled_size=(args.side_length, args.side_length),
+                            side_patch=args.side_patch)
         train_testset = CelebAHQ(root=args.root_dir, split='train', subset=args.render_subset,
-                            downsampled_size=(args.side_length, args.side_length))
+                            downsampled_size=(args.side_length, args.side_length),
+                            side_patch=args.side_patch)
         testset = CelebAHQ(root=args.root_dir, split='test', subset=args.render_subset,
-                            downsampled_size=(args.side_length, args.side_length))
+                            downsampled_size=(args.side_length, args.side_length),
+                            side_patch=args.side_patch)
     elif args.dataset == 'shapenet':
         input_dim, output_dim = 3, 1
         trainset = ShapeNet(root=args.root_dir, split='train', sampling=args.sampling, 
@@ -142,11 +141,10 @@ if __name__ == '__main__':
         ks=args.ks,
         latent_size=args.latent_size,
         gate_type=args.gate_type,
-        cond_scale=args.cond_scale,
-        learnable_s=args.learnable_s,
         use_meta_sgd=args.use_meta_sgd,
         outermost_linear=args.outermost_linear,
-        use_noise_input=args.use_noise_input
+        use_noise_input=args.use_noise_input,
+        npatch_side=args.side_patch,
     ).cuda()
 
     # count the number of parameters
@@ -235,7 +233,7 @@ if __name__ == '__main__':
             # Inner loop: latents update
             for step in range(args.inner_steps):
                 out, gates, importance, _ = inr_loe(latents, coords, top_k,
-                                                blend_alphas=blend_alphas, step=step) # N_imgs x N_coords x out_dim
+                                                blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
                 loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
@@ -311,15 +309,12 @@ if __name__ == '__main__':
                     if args.use_meta_sgd:
                         # wandb.log({"lr_mean": float(torch.abs(meta_sgd_inner).mean())})
                         log["lr_mean"] = float(torch.abs(meta_sgd_inner).mean())
-                    if args.learnable_s:
-                        # wandb.log({"cond_s": inr_loe.gate_module.s.item()})
-                        log["cond_s"] = inr_loe.gate_module.s.item()
-                    for l in range(latents.size(1)):
-                        # wandb.log({"latent_{}_abs_mean".format(l): latents[:, l].abs().mean().item()})
-                        log["latent_{}_abs_mean".format(l)] = latents[:, l].abs().mean().item()
-                    for l in range(len(means)):
-                        # wandb.log({"means_{}_abs_mean".format(l+1): means[l].abs().mean().item()})
-                        log["means_{}_abs_mean".format(l+1)] = means[l].abs().mean().item()
+                    # for l in range(latents.size(1)):
+                    #     # wandb.log({"latent_{}_abs_mean".format(l): latents[:, l].abs().mean().item()})
+                    #     log["latent_{}_abs_mean".format(l)] = latents[:, l].abs().mean().item()
+                    # for l in range(len(means)):
+                    #     # wandb.log({"means_{}_abs_mean".format(l+1): means[l].abs().mean().item()})
+                    #     log["means_{}_abs_mean".format(l+1)] = means[l].abs().mean().item()
                     if args.use_noise_input:
                         for name, module in inr_loe.net.named_modules():
                             if isinstance(module, NoiseCombiner):

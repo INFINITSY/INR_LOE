@@ -8,13 +8,21 @@ from PIL import Image
 from torchvision.transforms import Compose, Normalize, Resize, ToTensor
 
 
-def get_mgrid(sidelen, dim=2, max=1.0):
+def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1):
     """Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
     sidelen: int
-    dim: int"""
-    tensors = tuple(dim * [torch.linspace(-max, max, steps=sidelen)])
+    dim: int,
+    sidepatch: int. Number of patches along each side of the image."""
+    assert sidelen % sidepatch == 0, "sidelen must be divisible by npatch"
+
+    patchlen = sidelen // sidepatch
+    tensors = tuple(dim * [torch.linspace(-max, max, steps=patchlen)])
     mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1)
-    mgrid = mgrid.reshape(-1, dim)
+    mgrid = mgrid.reshape(-1, dim) # (patchlen^dim, dim)
+
+    mgrid = mgrid.unsqueeze(0).repeat(sidepatch ** dim, 1, 1) 
+    # (sidepatch^dim, patchlen^dim, dim)
+
     return mgrid
 
 
@@ -137,7 +145,7 @@ class CelebADataset(torch.utils.data.Dataset):
 
 
 class CelebAHQ(torch.utils.data.Dataset):
-    def __init__(self, root, split, subset=-1, downsampled_size=None, tf_dataset=False):
+    def __init__(self, root, split, subset=-1, downsampled_size=None, tf_dataset=False, side_patch=1):
         # SIZE (128 x 128)
         # super().__init__(self)
         assert split in ['train', 'test'], "Unknown split"
@@ -167,6 +175,7 @@ class CelebAHQ(torch.utils.data.Dataset):
             self.fnames = [self.fnames[i] for i in subset]
 
         self.downsampled_size = downsampled_size if downsampled_size is not None else (128, 128)
+        self.side_patch = side_patch
 
     def __len__(self):
         return len(self.fnames)
@@ -192,7 +201,13 @@ class CelebAHQ(torch.utils.data.Dataset):
         # permute to CHW
         img = np.transpose(img, (2, 0, 1))
 
-        in_dict = {"idx": torch.tensor(idx, dtype=torch.int64), "coords": get_mgrid(self.downsampled_size[0])}
+        in_dict = {
+            "idx": torch.tensor(idx, dtype=torch.int64), 
+            "coords": get_mgrid(
+                self.downsampled_size[0],
+                sidepatch=self.side_patch
+            )
+        }
         gt_dict = {"img": torch.from_numpy(img)}
 
         return in_dict, gt_dict
