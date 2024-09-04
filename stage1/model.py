@@ -393,8 +393,8 @@ class INRLoe(nn.Module):
         self.net_param[0].apply(first_layer_sine_init)
 
         # print net weight shape
-        for name, weights_all in self.net_param.named_parameters():
-            print(f"{name}: {weights_all.shape}")
+        # for name, weights_all in self.net_param.named_parameters():
+        #     print(f"{name}: {weights_all.shape}")
 
         # for inference
         self.net.append(MetaSequential(BatchLinear(input_dim, hidden_dim), self.nl))
@@ -418,8 +418,8 @@ class INRLoe(nn.Module):
         self.net = MetaSequential(*self.net)
         self.net.apply(sine_init)
         self.net[0].apply(first_layer_sine_init)
-        for name, weights_all in self.net.named_parameters():
-            print(f"{name}: {weights_all.shape}")
+        # for name, weights_all in self.net.named_parameters():
+        #     print(f"{name}: {weights_all.shape}")
 
         output_size = sum(self.num_exps)
 
@@ -558,9 +558,9 @@ class INRLoe(nn.Module):
         C = x.shape[-1]
         x = x.view(N_imgs, self.npatch, N_coords, C)
 
-        patchlen = int(N_coords ** (1 / self.input_dim)) # length of each side of the patch
+        P = int(N_coords ** (1 / self.input_dim)) # patch size
 
-        reshape_size = [N_imgs] + [self.npatch_side] * self.input_dim + [patchlen] * self.input_dim + [C]
+        reshape_size = [N_imgs] + [self.npatch_side] * self.input_dim + [P] * self.input_dim + [C]
         x = x.view(reshape_size)
         if self.input_dim == 2:
             # 2D case

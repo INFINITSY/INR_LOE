@@ -40,9 +40,48 @@ def get_sparsity(gate, l1_exp=1.0):
     return sparsity
 
 
-def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False):
+def patchify_with_padding(img, patch_size, padding_ratio=0.):
+    """
+    Split the image into patches. Allow for padding.
+    """
+    N, C, H, W = img.shape
+    stride = patch_size
+    npatch = H // patch_size
+
+    # pad the image
+    padding = int(padding_ratio * patch_size)
+    pad = (padding, padding, padding, padding)
+    padded_img = F.pad(img, pad, mode="constant", value=0) # (N, C, H+2*padding, W+2*padding)
+    padded_patch = patch_size + 2 * padding
+
+    # unfold the image
+    patches = padded_img.unfold(2, padded_patch, stride).unfold(3, padded_patch, stride)
+
+    # mask for the patches, 1 for valid pixels, 0 for padding
+    mask_psnr = torch.zeros_like(patches, dtype=torch.bool)
+    mask_psnr[..., padding:-padding, padding:-padding] = 1
+
+    patches = patches.permute(0, 1, 2, 4, 3, 5)
+    patches = patches.reshape(N, C, npatch * padded_patch, npatch * padded_patch)
+
+    mask_psnr = mask_psnr.permute(0, 1, 2, 4, 3, 5)
+    mask_psnr = mask_psnr.reshape(N, C, -1).permute(0, 2, 1)
+
+    # for the loss calculation, consider all the pixels except the border padding
+    mask_loss = torch.zeros_like(patches, dtype=torch.bool)
+    mask_loss[..., padding:-padding, padding:-padding] = 1
+    mask_loss = mask_loss.reshape(N, C, -1).permute(0, 2, 1)
+
+    return patches, mask_loss, mask_psnr
+
+
+def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False, 
+                 mask_loss=None, mask_psnr=None):
     # base mse loss
-    mse = criterion(out, y)
+    if mask_loss is not None:
+        mse = criterion(out[mask_loss], y[mask_loss])
+    else:
+        mse = criterion(out, y)
     loss = mse
 
     # sparsity loss
@@ -100,7 +139,9 @@ def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, to
 
     if args.dataset == "celeba":
         # need to scale mse
-        mse = criterion((out.detach() + 1) / 2, (y.detach() + 1) / 2)
+        out_psnr = out[mask_psnr].detach() if mask_psnr is not None else out.detach()
+        y_psnr = y[mask_psnr].detach() if mask_psnr is not None else y.detach()
+        mse = criterion((out_psnr + 1) / 2, (y_psnr + 1) / 2)
     else:
         mse = mse.detach()
     psnr = 10 * np.log10(1 / mse.item())

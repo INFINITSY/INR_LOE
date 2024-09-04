@@ -14,7 +14,7 @@ from sklearn.metrics import precision_score, recall_score
 import wandb
 from datasets import CelebADataset, ShapeNet, CelebAHQ
 from stage1.model import INRLoe, NoiseCombiner
-from stage1.utils import compute_latents, compute_loss, render
+from stage1.utils import compute_latents, compute_loss, render, patchify_with_padding
 
 if __name__ == '__main__':
 
@@ -28,6 +28,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_subset', type=int, default=-1)
     parser.add_argument('--render_subset', type=int, default=9)
     parser.add_argument('--side_patch', type=int, default=1)
+    parser.add_argument('--padding_ratio', type=float, default=0, help='patch padding ratio')
 
     # CelebA configs
     parser.add_argument('--side_length', type=int, default=64)
@@ -109,7 +110,7 @@ if __name__ == '__main__':
         input_dim, output_dim = 2, 3
         trainset = CelebAHQ(root=args.root_dir, split='train', subset=args.train_subset,
                             downsampled_size=(args.side_length, args.side_length),
-                            side_patch=args.side_patch)
+                            side_patch=args.side_patch, padding_ratio=args.padding_ratio)
         train_testset = CelebAHQ(root=args.root_dir, split='train', subset=args.render_subset,
                             downsampled_size=(args.side_length, args.side_length),
                             side_patch=args.side_patch)
@@ -220,8 +221,14 @@ if __name__ == '__main__':
             # Initialise meta-gradient
             meta_grad = copy.deepcopy(meta_grad_init)
 
+            mask_loss = None
+            mask_psnr = None
             if args.dataset == 'celeba':
                 N, C, H, W = img.shape
+                if args.side_patch > 1 and args.padding_ratio > 0:
+                    img, mask_loss, mask_psnr = patchify_with_padding(
+                        img, args.side_length // args.side_patch, args.padding_ratio
+                    )
                 y = img.reshape(N, C, -1)
                 y = y.permute(0, 2, 1)  # N_imgs x N_coords x 3
             elif args.dataset == 'shapenet':
@@ -234,7 +241,8 @@ if __name__ == '__main__':
             for step in range(args.inner_steps):
                 out, gates, importance, _ = inr_loe(latents, coords, top_k,
                                                 blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
-                loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
+                loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                                       mask_loss=mask_loss, mask_psnr=mask_psnr)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
                 
@@ -246,7 +254,8 @@ if __name__ == '__main__':
             # Update the shared weights
             out, gates, importance, means = inr_loe(latents, coords, top_k,
                                             blend_alphas=blend_alphas)
-            loss, psnr = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
+            loss, psnr = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                                      mask_loss=mask_loss, mask_psnr=mask_psnr)
             if args.ort_loss_w > 0:
                 exps_sim = inr_loe.compute_exps_sim()
                 ort_loss = torch.mean(exps_sim)

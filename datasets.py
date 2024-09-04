@@ -8,14 +8,23 @@ from PIL import Image
 from torchvision.transforms import Compose, Normalize, Resize, ToTensor
 
 
-def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1):
+def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1, padding_ratio=0.):
     """Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
     sidelen: int
     dim: int,
-    sidepatch: int. Number of patches along each side of the image."""
+    sidepatch: int. Number of patches along each side of the image.
+    padding_ratio: float. The ratio of padding points to add to the grid.
+    """
     assert sidelen % sidepatch == 0, "sidelen must be divisible by npatch"
-
     patchlen = sidelen // sidepatch
+
+    if padding_ratio > 0:
+        # Calculate the number of padding points based on the ratio
+        num_padding = int(padding_ratio * patchlen)
+        # Extend the grid to include padding
+        max += (2 * max / (patchlen - 1)) * num_padding
+        patchlen += 2 * num_padding
+
     tensors = tuple(dim * [torch.linspace(-max, max, steps=patchlen)])
     mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1)
     mgrid = mgrid.reshape(-1, dim) # (patchlen^dim, dim)
@@ -145,7 +154,8 @@ class CelebADataset(torch.utils.data.Dataset):
 
 
 class CelebAHQ(torch.utils.data.Dataset):
-    def __init__(self, root, split, subset=-1, downsampled_size=None, tf_dataset=False, side_patch=1):
+    def __init__(self, root, split, subset=-1, downsampled_size=None, tf_dataset=False, 
+                 side_patch=1, padding_ratio=0.):
         # SIZE (128 x 128)
         # super().__init__(self)
         assert split in ['train', 'test'], "Unknown split"
@@ -176,6 +186,7 @@ class CelebAHQ(torch.utils.data.Dataset):
 
         self.downsampled_size = downsampled_size if downsampled_size is not None else (128, 128)
         self.side_patch = side_patch
+        self.padding_ratio = padding_ratio
 
     def __len__(self):
         return len(self.fnames)
@@ -205,7 +216,8 @@ class CelebAHQ(torch.utils.data.Dataset):
             "idx": torch.tensor(idx, dtype=torch.int64), 
             "coords": get_mgrid(
                 self.downsampled_size[0],
-                sidepatch=self.side_patch
+                sidepatch=self.side_patch,
+                padding_ratio=self.padding_ratio,
             )
         }
         gt_dict = {"img": torch.from_numpy(img)}
