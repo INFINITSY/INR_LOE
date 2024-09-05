@@ -14,7 +14,7 @@ from sklearn.metrics import precision_score, recall_score
 import wandb
 from datasets import CelebADataset, ShapeNet, CelebAHQ
 from stage1.model import INRLoe, NoiseCombiner
-from stage1.utils import compute_latents, compute_loss, render, patchify_with_padding
+from stage1.utils import compute_latents, compute_loss, render, patchify_with_padding, get_masks
 
 if __name__ == '__main__':
 
@@ -51,6 +51,7 @@ if __name__ == '__main__':
     parser.add_argument('--cov_loss_w', type=float, default=0, help='weight for cov loss')
     parser.add_argument('--ort_loss_w', type=float, default=0, help='weight exps orthogonal regularization loss')
     parser.add_argument('--sparse_loss_w', type=float, default=0, help='weight for sparse loss')
+    parser.add_argument('--overlap_loss_w', type=float, default=1, help='weight for overlap consistency loss')
     parser.add_argument('--warmup_epochs', type=int, default=0, help='number of warmup epochs for top k')
 
     # model configs
@@ -113,10 +114,10 @@ if __name__ == '__main__':
                             side_patch=args.side_patch, padding_ratio=args.padding_ratio)
         train_testset = CelebAHQ(root=args.root_dir, split='train', subset=args.render_subset,
                             downsampled_size=(args.side_length, args.side_length),
-                            side_patch=args.side_patch)
+                            side_patch=args.side_patch, padding_ratio=args.padding_ratio)
         testset = CelebAHQ(root=args.root_dir, split='test', subset=args.render_subset,
                             downsampled_size=(args.side_length, args.side_length),
-                            side_patch=args.side_patch)
+                            side_patch=args.side_patch, padding_ratio=args.padding_ratio)
     elif args.dataset == 'shapenet':
         input_dim, output_dim = 3, 1
         trainset = ShapeNet(root=args.root_dir, split='train', sampling=args.sampling, 
@@ -182,6 +183,14 @@ if __name__ == '__main__':
         # exit the program after computing the latents
         sys.exit()
 
+    # prepare masks when using patchify and padding
+    if args.side_patch > 1 and args.padding_ratio > 0:
+        mask_all, mask_psnr, mask_overlap = get_masks(
+            args.side_length, args.side_patch, args.padding_ratio
+        )
+    else:
+        mask_all, mask_psnr, mask_overlap = None, None, None
+
     for epoch in range(start_epoch, args.epochs):
         inr_loe.train()
         top_k = args.top_k and epoch >= args.warmup_epochs
@@ -221,13 +230,11 @@ if __name__ == '__main__':
             # Initialise meta-gradient
             meta_grad = copy.deepcopy(meta_grad_init)
 
-            mask_loss = None
-            mask_psnr = None
             if args.dataset == 'celeba':
                 N, C, H, W = img.shape
                 if args.side_patch > 1 and args.padding_ratio > 0:
-                    img, mask_loss, mask_psnr = patchify_with_padding(
-                        img, args.side_length // args.side_patch, args.padding_ratio
+                    img = patchify_with_padding(
+                        img, args.side_patch, args.padding_ratio
                     )
                 y = img.reshape(N, C, -1)
                 y = y.permute(0, 2, 1)  # N_imgs x N_coords x 3
@@ -242,7 +249,7 @@ if __name__ == '__main__':
                 out, gates, importance, _ = inr_loe(latents, coords, top_k,
                                                 blend_alphas=blend_alphas) # N_imgs x N_coords x out_dim
                 loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
-                                       mask_loss=mask_loss, mask_psnr=mask_psnr)
+                                       mask_overlap=mask_overlap, mask_psnr=mask_psnr)
                 latent_gradients = \
                     torch.autograd.grad(loss, latents, create_graph=True)[0]
                 
@@ -255,7 +262,7 @@ if __name__ == '__main__':
             out, gates, importance, means = inr_loe(latents, coords, top_k,
                                             blend_alphas=blend_alphas)
             loss, psnr = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
-                                      mask_loss=mask_loss, mask_psnr=mask_psnr)
+                                      mask_overlap=mask_overlap, mask_psnr=mask_psnr)
             if args.ort_loss_w > 0:
                 exps_sim = inr_loe.compute_exps_sim()
                 ort_loss = torch.mean(exps_sim)

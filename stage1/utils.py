@@ -11,13 +11,30 @@ import tqdm
 from sklearn.metrics import recall_score
 
 
-def get_mgrid(sidelen, dim=2, max=1.0):
+def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1, padding_ratio=0.):
     """Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
     sidelen: int
-    dim: int"""
-    tensors = tuple(dim * [torch.linspace(-max, max, steps=sidelen)])
-    mgrid = torch.stack(torch.meshgrid(*tensors, indexing='ij'), dim=-1)
-    mgrid = mgrid.reshape(-1, dim)
+    dim: int,
+    sidepatch: int. Number of patches along each side of the image.
+    padding_ratio: float. The ratio of padding points to add to the grid.
+    """
+    assert sidelen % sidepatch == 0, "sidelen must be divisible by npatch"
+    patchlen = sidelen // sidepatch
+
+    if padding_ratio > 0:
+        # Calculate the number of padding points based on the ratio
+        num_padding = int(padding_ratio * patchlen)
+        # Extend the grid to include padding
+        max += (2 * max / (patchlen - 1)) * num_padding
+        patchlen += 2 * num_padding
+
+    tensors = tuple(dim * [torch.linspace(-max, max, steps=patchlen)])
+    mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1)
+    mgrid = mgrid.reshape(-1, dim) # (patchlen^dim, dim)
+
+    mgrid = mgrid.unsqueeze(0).repeat(sidepatch ** dim, 1, 1) 
+    # (sidepatch^dim, patchlen^dim, dim)
+
     return mgrid
 
 
@@ -25,9 +42,10 @@ def get_load(gate):
     """Compute the true load per expert, given the gates.
     The load is the number of examples for which the corresponding gate is >0.
     Args:
-    gates: a `Tensor` of shape [batch_size, n]
+        gates: a `Tensor` of shape [batch_size, n]
+
     Returns:
-    a float32 `Tensor` of shape [n]
+        a float32 `Tensor` of shape [n]
     """
     return (gate > 0).sum(0)
 
@@ -40,11 +58,85 @@ def get_sparsity(gate, l1_exp=1.0):
     return sparsity
 
 
-def patchify_with_padding(img, patch_size, padding_ratio=0.):
+def get_masks(side_length, side_patch, padding_ratio=0.):
+    '''
+    Generate masks for the patches, psnr calculation, and overlap
+    Args:
+        side_length: the side length of the image
+        side_patch: the number of patches along each side of the image
+        padding_ratio: the ratio of padding to the patch size
+
+    H', W' = npatch * (patch_size + 2 * padding)
+
+    Returns:
+        mask_all: mask for all the pixels except the border padding. (H', W')
+        mask_psnr: mask for psnr calculation. (H', W')
+        mask_overlap: mask for overlap. (4, H', W')
+    '''
+    patch_size = side_length // side_patch
+    npatch = side_length // patch_size
+    padding = int(padding_ratio * patch_size)
+    padded_patch = patch_size + 2 * padding
+    H = W = npatch * padded_patch
+    
+    # base mask of shape (npatch, npatch, padded_patch, padded_patch)
+    mask = torch.zeros(npatch, npatch, padded_patch, padded_patch, dtype=torch.bool)
+
+    def reshape_and_permute(m):
+        return m.permute(0, 2, 1, 3).reshape(H, W)
+
+    # mask for psnr calculation
+    mask_psnr = mask.clone()
+    mask_psnr[..., padding:-padding, padding:-padding] = 1
+    mask_psnr = reshape_and_permute(mask_psnr)
+    
+    # mask for all the pixels except the border padding
+    mask_all = mask.clone()
+    mask_all = reshape_and_permute(mask_all)
+    mask_all[padding:-padding, padding:-padding] = 1
+
+    # mask for overlap
+    # right overlap
+    mask_r = mask.clone()
+    mask_r[..., :, patch_size:] = 1
+    mask_r = reshape_and_permute(mask_r)
+    mask_r[:, -2 * padding:] = 0
+
+    # left overlap
+    mask_l = mask.clone()
+    mask_l[..., :, :-patch_size] = 1
+    mask_l = reshape_and_permute(mask_l)
+    mask_l[:, :2 * padding] = 0
+
+    # bottom overlap
+    mask_b = mask.clone()
+    mask_b[..., patch_size:, :] = 1
+    mask_b = reshape_and_permute(mask_b)
+    mask_b[-2 * padding:, :] = 0
+
+    # top overlap
+    mask_t = mask.clone()
+    mask_t[..., :-patch_size, :] = 1
+    mask_t = reshape_and_permute(mask_t)
+    mask_t[:2 * padding, :] = 0
+
+    # stack the masks
+    mask_overlap = torch.stack([mask_r, mask_l, mask_b, mask_t], dim=0) # shape: (4, H, W)
+    # remove borader
+    border_mask = torch.ones_like(mask_overlap, dtype=torch.bool)
+    border_mask[:, padding:-padding, padding:-padding] = 0
+    mask_overlap[border_mask] = 0
+    mask_overlap = mask_overlap
+
+    return mask_all.reshape(-1), mask_psnr.reshape(-1), mask_overlap.reshape(4, -1)
+
+
+def patchify_with_padding(img, side_patch, padding_ratio=0.):
     """
     Split the image into patches. Allow for padding.
     """
     N, C, H, W = img.shape
+    patch_size = H // side_patch
     stride = patch_size
     npatch = H // patch_size
 
@@ -56,33 +148,35 @@ def patchify_with_padding(img, patch_size, padding_ratio=0.):
 
     # unfold the image
     patches = padded_img.unfold(2, padded_patch, stride).unfold(3, padded_patch, stride)
-
-    # mask for the patches, 1 for valid pixels, 0 for padding
-    mask_psnr = torch.zeros_like(patches, dtype=torch.bool)
-    mask_psnr[..., padding:-padding, padding:-padding] = 1
+    # shape is (N, C, npatch, npatch, padded_patch, padded_patch)
 
     patches = patches.permute(0, 1, 2, 4, 3, 5)
     patches = patches.reshape(N, C, npatch * padded_patch, npatch * padded_patch)
+    # shape is (N, C, H', W')
 
-    mask_psnr = mask_psnr.permute(0, 1, 2, 4, 3, 5)
-    mask_psnr = mask_psnr.reshape(N, C, -1).permute(0, 2, 1)
-
-    # for the loss calculation, consider all the pixels except the border padding
-    mask_loss = torch.zeros_like(patches, dtype=torch.bool)
-    mask_loss[..., padding:-padding, padding:-padding] = 1
-    mask_loss = mask_loss.reshape(N, C, -1).permute(0, 2, 1)
-
-    return patches, mask_loss, mask_psnr
+    return patches
 
 
 def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False, 
-                 mask_loss=None, mask_psnr=None):
+                 mask_overlap=None, mask_psnr=None):
     # base mse loss
-    if mask_loss is not None:
-        mse = criterion(out[mask_loss], y[mask_loss])
+    if mask_psnr is not None:
+        # mask_psnr shape: H*W. Need to reshape to (N, H*W, C) as y
+        mask_psnr = mask_psnr.unsqueeze(0).unsqueeze(-1).expand_as(y)
+        mse = criterion(out[mask_psnr], y[mask_psnr])
     else:
         mse = criterion(out, y)
     loss = mse
+
+    # overlap consistency loss
+    if mask_overlap is not None:
+        mask_overlap = mask_overlap.unsqueeze(1).unsqueeze(-1).expand(
+            -1, y.size(0), -1, y.size(-1)
+        )
+        loss += args.overlap_loss_w * (
+            criterion(out[mask_overlap[0]], out[mask_overlap[1]]) + 
+            criterion(out[mask_overlap[2]], out[mask_overlap[3]])
+        )
 
     # sparsity loss
     if args.sparse_loss_w > 0 and top_k is False:
@@ -340,8 +434,20 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     latents.requires_grad = True
     lr_inner_render = args.lr_inner * N / args.batch_size
 
+    # prepare masks when using patchify and padding
+    if args.side_patch > 1 and args.padding_ratio > 0:
+        _, mask_psnr, mask_overlap = get_masks(
+            args.side_length, args.side_patch, args.padding_ratio
+        )
+    else:
+        mask_psnr, mask_overlap = None, None
+
     if args.dataset == "celeba":
         C = img.size(1)
+        if args.side_patch > 1 and args.padding_ratio > 0:
+            img = patchify_with_padding(
+                img, args.side_patch, args.padding_ratio
+            )
         y = img.reshape(N, C, -1)
         y = y.permute(0, 2, 1)  # N_imgs x N_coords x 3
     elif args.dataset == "shapenet":
@@ -355,11 +461,12 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     top_k = args.top_k and epoch >= args.warmup_epochs
 
     # Inner loop: latents update
-    for step in range(args.inner_steps):
+    for _ in range(args.inner_steps):
         out, gates, importance, _ = model(
             latents, coords, top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
-        loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
+        loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                               mask_overlap=mask_overlap, mask_psnr=mask_psnr)
         latent_gradients = torch.autograd.grad(loss, latents)[0]
 
         if args.use_meta_sgd:
@@ -371,6 +478,7 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
         out, gates, _, means = model(
             latents, coords, top_k, blend_alphas=blend_alphas
         )
+        out = out[mask_psnr] if mask_psnr is not None else out
 
     mode = "test" if test else "train"
     save_path = os.path.join(args.save, mode)
@@ -513,8 +621,20 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         latents.requires_grad = True
         lr_inner_render = args.lr_inner * N / args.batch_size
 
+        # prepare masks when using patchify and padding
+        if args.side_patch > 1 and args.padding_ratio > 0:
+            _, mask_psnr, mask_overlap = get_masks(
+                args.side_length, args.side_patch, args.padding_ratio
+            )
+        else:
+            mask_psnr, mask_overlap = None, None
+
         if args.dataset == "celeba":
             C = img.size(1)
+            if args.side_patch > 1 and args.padding_ratio > 0:
+                img = patchify_with_padding(
+                    img, args.side_patch, args.padding_ratio
+                )
             y = img.reshape(N, C, -1)
             y = y.permute(0, 2, 1)
         elif args.dataset == "shapenet":
@@ -528,10 +648,11 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         top_k = args.top_k and epoch >= args.warmup_epochs
 
         # inner loop for latents update
-        for step in range(args.inner_steps):
+        for _ in range(args.inner_steps):
             out, gates, importance, _ = model(latents, coords, top_k,
                                             blend_alphas=blend_alphas)
-            loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
+            loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                                   mask_overlap=mask_overlap, mask_psnr=mask_psnr)
             latent_gradients = \
                     torch.autograd.grad(loss, latents)[0]
             
@@ -543,11 +664,13 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         with torch.no_grad():
             out, gates, importance, means = model(latents, coords, top_k,
                                               blend_alphas=blend_alphas)
-        _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k)
+        _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                                    mask_overlap=mask_overlap, mask_psnr=mask_psnr)
         
         psnr += psnr_iter
         if args.dataset == 'shapenet':
             pred = out >= 0.5
+            pred = pred[mask_psnr] if mask_psnr is not None else pred
             acc += pred.float().eq(y).float().mean()
             rec += recall_score(y.cpu().numpy().flatten(), pred.cpu().numpy().flatten())
 
