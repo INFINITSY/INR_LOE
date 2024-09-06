@@ -8,7 +8,7 @@ from PIL import Image
 from torchvision.transforms import Compose, Normalize, Resize, ToTensor
 
 
-def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1, padding_ratio=0.):
+def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1, padding_ratio=0., continuous=False):
     """Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
     sidelen: int
     dim: int,
@@ -18,18 +18,27 @@ def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1, padding_ratio=0.):
     assert sidelen % sidepatch == 0, "sidelen must be divisible by npatch"
     patchlen = sidelen // sidepatch
 
-    if padding_ratio > 0:
-        # Calculate the number of padding points based on the ratio
-        num_padding = int(padding_ratio * patchlen)
-        # Extend the grid to include padding
+    # Calculate the number of padding points based on the ratio
+    num_padding = int(padding_ratio * patchlen)
+
+    if continuous:
+        max += (2 * max / (sidelen - 1)) * num_padding
+        sidelen += 2 * num_padding
+        padded_patchlen = patchlen + 2 * num_padding
+        # Create a grid of coordinates in the range of -max to max
+        tensors = tuple(dim * [torch.linspace(-max, max, steps=sidelen)])
+        mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1) # (sidelen, sidelen, dim)
+        mgrid = mgrid.permute(2, 0, 1) # (dim, sidelen, sidelen)
+        mgrid = mgrid.unfold(1, padded_patchlen, patchlen).unfold(2, padded_patchlen, patchlen) # (dim, sidepatch, sidepatch, patchlen, patchlen)
+        mgrid = mgrid.reshape(dim, sidepatch ** dim, padded_patchlen ** dim) # (sidepatch^dim, padded_patchlen^dim, dim)
+        mgrid = mgrid.permute(1, 2, 0) # (patchlen^dim, padded_patchlen^dim, dim)
+    else:
         max += (2 * max / (patchlen - 1)) * num_padding
         patchlen += 2 * num_padding
-
-    tensors = tuple(dim * [torch.linspace(-max, max, steps=patchlen)])
-    mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1)
-    mgrid = mgrid.reshape(-1, dim) # (patchlen^dim, dim)
-
-    mgrid = mgrid.unsqueeze(0).repeat(sidepatch ** dim, 1, 1) 
+        tensors = tuple(dim * [torch.linspace(-max, max, steps=patchlen)])
+        mgrid = torch.stack(torch.meshgrid(*tensors, indexing="ij"), dim=-1)
+        mgrid = mgrid.reshape(-1, dim) # (patchlen^dim, dim)
+        mgrid = mgrid.unsqueeze(0).repeat(sidepatch ** dim, 1, 1) 
     # (sidepatch^dim, patchlen^dim, dim)
 
     return mgrid
@@ -155,7 +164,7 @@ class CelebADataset(torch.utils.data.Dataset):
 
 class CelebAHQ(torch.utils.data.Dataset):
     def __init__(self, root, split, subset=-1, downsampled_size=None, tf_dataset=False, 
-                 side_patch=1, padding_ratio=0.):
+                 side_patch=1, padding_ratio=0., continuous=False):
         # SIZE (128 x 128)
         # super().__init__(self)
         assert split in ['train', 'test'], "Unknown split"
@@ -187,6 +196,7 @@ class CelebAHQ(torch.utils.data.Dataset):
         self.downsampled_size = downsampled_size if downsampled_size is not None else (128, 128)
         self.side_patch = side_patch
         self.padding_ratio = padding_ratio
+        self.continuous = continuous
 
     def __len__(self):
         return len(self.fnames)
@@ -195,14 +205,6 @@ class CelebAHQ(torch.utils.data.Dataset):
         path = os.path.join(self.root, self.fnames[idx])
         img = Image.open(path)
         if self.downsampled_size != img.size:
-            width, height = img.size  # Get dimensions
-
-            # s = min(width, height)
-            # left = (width - s) / 2
-            # top = (height - s) / 2
-            # right = (width + s) / 2
-            # bottom = (height + s) / 2
-            # img = img.crop((left, top, right, bottom))
             img = img.resize(self.downsampled_size, resample=Image.BICUBIC)
 
         img = np.asarray(img).astype(np.float32) / 255.0
@@ -218,6 +220,7 @@ class CelebAHQ(torch.utils.data.Dataset):
                 self.downsampled_size[0],
                 sidepatch=self.side_patch,
                 padding_ratio=self.padding_ratio,
+                continuous=self.continuous
             )
         }
         gt_dict = {"img": torch.from_numpy(img)}

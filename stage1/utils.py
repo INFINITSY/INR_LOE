@@ -158,12 +158,14 @@ def patchify_with_padding(img, side_patch, padding_ratio=0.):
 
 
 def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, top_k=False, 
-                 mask_overlap=None, mask_psnr=None):
+                 mask_overlap=None, mask_psnr=None, mask_all=None):
     # base mse loss
     if mask_psnr is not None:
-        # mask_psnr shape: H*W. Need to reshape to (N, H*W, C) as y
         mask_psnr = mask_psnr.unsqueeze(0).unsqueeze(-1).expand_as(y)
-        mse = criterion(out[mask_psnr], y[mask_psnr])
+    if mask_all is not None:
+        # mask_all shape: H*W. Need to reshape to (N, H*W, C) as y
+        mask_all = mask_all.unsqueeze(0).unsqueeze(-1).expand_as(y)
+        mse = criterion(out[mask_all], y[mask_all])
     else:
         mse = criterion(out, y)
     loss = mse
@@ -436,11 +438,11 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
 
     # prepare masks when using patchify and padding
     if args.side_patch > 1 and args.padding_ratio > 0:
-        _, mask_psnr, mask_overlap = get_masks(
+        mask_all, mask_psnr, _ = get_masks(
             args.side_length, args.side_patch, args.padding_ratio
         )
     else:
-        mask_psnr, mask_overlap = None, None
+        mask_all, mask_psnr = None, None
 
     if args.dataset == "celeba":
         C = img.size(1)
@@ -466,7 +468,7 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
             latents, coords, top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
         loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
-                               mask_overlap=mask_overlap, mask_psnr=mask_psnr)
+                               mask_all=mask_all, mask_psnr=mask_psnr)
         latent_gradients = torch.autograd.grad(loss, latents)[0]
 
         if args.use_meta_sgd:
@@ -478,7 +480,10 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
         out, gates, _, means = model(
             latents, coords, top_k, blend_alphas=blend_alphas
         )
-        out = out[mask_psnr] if mask_psnr is not None else out
+        if mask_psnr is not None:
+            # mask_psnr shape: H*W. Need to reshape to (N, H*W, C) as y
+            mask_psnr = mask_psnr.unsqueeze(0).unsqueeze(-1).expand_as(out)
+            out = out[mask_psnr]
 
     mode = "test" if test else "train"
     save_path = os.path.join(args.save, mode)
@@ -623,11 +628,11 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
 
         # prepare masks when using patchify and padding
         if args.side_patch > 1 and args.padding_ratio > 0:
-            _, mask_psnr, mask_overlap = get_masks(
+            mask_all, mask_psnr, _ = get_masks(
                 args.side_length, args.side_patch, args.padding_ratio
             )
         else:
-            mask_psnr, mask_overlap = None, None
+            mask_all, mask_psnr = None, None
 
         if args.dataset == "celeba":
             C = img.size(1)
@@ -652,7 +657,7 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
             out, gates, importance, _ = model(latents, coords, top_k,
                                             blend_alphas=blend_alphas)
             loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
-                                   mask_overlap=mask_overlap, mask_psnr=mask_psnr)
+                                   mask_all=mask_all, mask_psnr=mask_psnr)
             latent_gradients = \
                     torch.autograd.grad(loss, latents)[0]
             
@@ -665,7 +670,7 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
             out, gates, importance, means = model(latents, coords, top_k,
                                               blend_alphas=blend_alphas)
         _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
-                                    mask_overlap=mask_overlap, mask_psnr=mask_psnr)
+                                    mask_all=mask_all, mask_psnr=mask_psnr)
         
         psnr += psnr_iter
         if args.dataset == 'shapenet':

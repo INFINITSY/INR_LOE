@@ -138,11 +138,13 @@ class MoECombiner(torch_geometric.nn.conv.MessagePassing):
 
 
 class ConditionalGateModule(nn.Module):
-    def __init__(self, latent_size, num_exps=[64, 64, 64, 64], s=1.0, npatch=1):
+    def __init__(self, latent_size, dims=[64, 64, 64, 3], num_exps=[64, 64, 64, 64], 
+                 npatch=1, bias_patch=False):
         super().__init__()
         self.num_exps = num_exps
-        self.s = s
         self.npatch = npatch
+        self.dims = dims
+        self.bias_patch = bias_patch
         self.gate_module = nn.ModuleList()
         self.mean_module = nn.ModuleList()
         # output gating vector for each layer plus mean and std for subsequent layer
@@ -150,7 +152,12 @@ class ConditionalGateModule(nn.Module):
             # self.nets.append(nn.Linear(latent_size, num_exps[i] + 1 * latent_size))
             # gate_in = latent_size if i == 0 else latent_size * 2
             gate_in = latent_size
-            gate_out = npatch * num_exps[i]
+            if bias_patch:
+                # all patch share the same gate but different bias
+                gate_out = num_exps[i] + npatch * dims[i]
+            else:
+                # each patch has its own gate
+                gate_out = npatch * num_exps[i]
 
             self.gate_module.append(nn.Sequential(
                 nn.Linear(gate_in, gate_out),
@@ -167,8 +174,11 @@ class ConditionalGateModule(nn.Module):
 
         # init output of each layer to be uniform
         for i, net in enumerate(self.gate_module):
-            # set the last linear layer's bias to be uniform
-            net[-1].bias.data.fill_(1 / num_exps[i])
+            # set the last linear layer's bias (for exps) to be uniform
+            # kaiming uniform initialization the weights of the last layer
+            # nn.init.kaiming_uniform_(net[-1].weight, nonlinearity='linear')
+            net[-1].bias.data[:num_exps[i]].fill_(1 / num_exps[i])
+            net[-1].bias.data[num_exps[i]:].fill_(0)
 
         # for i, net in enumerate(self.mean_module):
         #     net[-1].bias.data.fill_(1)
@@ -179,13 +189,9 @@ class ConditionalGateModule(nn.Module):
         N = latents.shape[0]
         gates = []
         means = []
-        # log_vars = []
-        # mean = torch.ones_like(latents[:, 0])  # N_imgs x latent_size
-        # log_var = torch.zeros_like(latents[:, 0])  # N_imgs x latent_size
+        biases = [] if self.bias_patch else None
 
         for i, net in enumerate(self.gate_module):
-            # reparametrize the latents
-            # latents_rprm = mean * latents[:, i]  # N_imgs x latent_size
             latents_i = latents[:, i]
             if step is not None and (i > step or i < step - 2):
                 latents_i = latents_i.detach()
@@ -194,19 +200,24 @@ class ConditionalGateModule(nn.Module):
             else:
                 latents_rprm = mean[-1] * latents_i  # N_imgs x latent_size
                 # latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
-            gate = net(latents_rprm) # N_imgs x (npatch * num_exps[i])
+            gate_raw = net(latents_rprm) # N_imgs x gate_out
             if i < len(self.gate_module) - 1:
                 # for the next layer
-                mean = self.mean_module[i](gate)  # N_imgs x latent_size
-                # scale the mean
-                mean = mean * self.s
+                mean = self.mean_module[i](gate_raw)  # N_imgs x latent_size
                 means.append(mean)
-            gate = gate.view(N * self.npatch, self.num_exps[i]) # (N_imgs * npatch) x num_exps[i]
+            if self.bias_patch:
+                gate, bias = gate_raw[:, :self.num_exps[i]], gate_raw[:, self.num_exps[i]:]
+                gate = gate.unsqueeze(1).expand(-1, self.npatch, -1).reshape(N * self.npatch, -1) # (N_imgs * npatch) x num_exps[i]
+                bias = bias.reshape(N * self.npatch, -1) # (N_imgs * npatch) x hidden_size
+                biases.append(bias)
+            else:
+                gate = gate_raw.view(N * self.npatch, self.num_exps[i]) # (N_imgs * npatch) x num_exps[i]
             gates.append(gate)
 
         gates = torch.cat(gates, dim=-1)  # (N_imgs * npatch) x sum(num_exps)
+        biases = torch.cat(biases, dim=-1) if self.bias_patch else None # (N_imgs * npatch) x sum(dims)
 
-        return gates, means
+        return gates, means, biases
 
 
 class SeparateGateModule(nn.Module):
@@ -335,12 +346,14 @@ class INRLoe(nn.Module):
         meta_sgd_clip_range: Tuple[float, float] = (0., 1.),
         use_noise_input: bool = False,
         npatch_side: int = 1,
+        bias_patch: bool = False,
     ):
         super(INRLoe, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_hidden = num_hidden
+        self.dims = [hidden_dim] * num_hidden + [output_dim]
         self.net_param = []
         self.net = []
         self.nl = Sine()
@@ -357,6 +370,7 @@ class INRLoe(nn.Module):
         self.use_noise_input = use_noise_input
         self.npatch_side = npatch_side
         self.npatch = npatch_side ** input_dim
+        self.bias_patch = bias_patch
         # Initialize meta-SGD learning rates
         if self.use_meta_sgd:
             if self.gate_type == "shared":
@@ -425,7 +439,9 @@ class INRLoe(nn.Module):
 
         if self.gate_type == "conditional":
             self.gate_module = ConditionalGateModule(
-                latent_size, num_exps=self.num_exps, npatch=self.npatch
+                latent_size, dims=self.dims,
+                num_exps=self.num_exps, npatch=self.npatch,
+                bias_patch=self.bias_patch
             )
         elif self.gate_type == "separate":
             self.gate_module = SeparateGateModule(
@@ -485,7 +501,7 @@ class INRLoe(nn.Module):
 
         return gates  # , bias, load
 
-    def get_combined_weight(self, gates):
+    def get_combined_weight(self, gates, biases=None):
         # gates is a tuple of len(num_exps) tensors of shape N_imgs x num_exps[i]
         # return combined weights
 
@@ -502,6 +518,9 @@ class INRLoe(nn.Module):
             combined_weight = combined_weight.view(
                 [N_imgs, w_size[0] // N_exps] + list(w_size[1:])
             )  # N_imgs x hidden_dim x input_dim
+            if 'bias' in name and self.bias_patch:
+                bias = biases[l]  # N_imgs x hidden_dim
+                combined_weight = combined_weight + bias
             if self.use_noise_input:
                 # name number should be twice
                 name_split = name.split(".")
@@ -518,10 +537,11 @@ class INRLoe(nn.Module):
         # shape of coords: (N_imgs * npatch) x N_coords x input_dim
 
         if self.gate_type == "conditional":
-            raw_gates, means = self.gate_module(latents, step)
+            raw_gates, means, biases = self.gate_module(latents, step)
         else:
             raw_gates = self.gate_module(latents)
             means = None
+            biases = None
         # shape of raw_gates: (N_imgs * npatch) x sum(num_exps)
 
         # split gates to according to self.num_exps
@@ -532,6 +552,12 @@ class INRLoe(nn.Module):
         # to list
         gates = list(gates)
 
+        if self.bias_patch:
+            biases = torch.split(
+                biases, self.dims, dim=-1
+            ) # tuple of len(num_exps) tensors of shape (N_imgs * npatch) x dims[i]
+            biases = list(biases)
+
         if top_k:
             gates = self.noisy_top_k_gating(latents, gates)
 
@@ -541,7 +567,7 @@ class INRLoe(nn.Module):
 
         importance = [torch.sum(gate, dim=0) for gate in gates]  # len(num_exps) x num_exps[i]
 
-        params = self.get_combined_weight(gates)  # dict of combined weights
+        params = self.get_combined_weight(gates, biases)  # dict of combined weights
 
         x = coords
         x = self.net(x, params=params) # (N_imgs * npatch) x N_coords x output_dim
