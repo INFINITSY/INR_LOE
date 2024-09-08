@@ -198,7 +198,7 @@ class ConditionalGateModule(nn.Module):
             if i == 0:
                 latents_rprm = latents_i # N_imgs x latent_size
             else:
-                latents_rprm = mean[-1] * latents_i  # N_imgs x latent_size
+                latents_rprm = mean * latents_i  # N_imgs x latent_size
                 # latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
             gate_raw = net(latents_rprm) # N_imgs x gate_out
             if i < len(self.gate_module) - 1:
