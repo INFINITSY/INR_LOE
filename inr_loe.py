@@ -9,12 +9,12 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import precision_score, recall_score
-
 import wandb
-from datasets import CelebADataset, ShapeNet, CelebAHQ
+from datasets import CelebADataset, CelebAHQ, ShapeNet
+from sklearn.metrics import precision_score, recall_score
 from stage1.model import INRLoe, NoiseCombiner
-from stage1.utils import compute_latents, compute_loss, render, patchify_with_padding, get_masks
+from stage1.utils import (compute_latents, compute_loss, evaluate, get_masks,
+                          patchify_with_padding, render)
 
 if __name__ == '__main__':
 
@@ -125,6 +125,10 @@ if __name__ == '__main__':
                             downsampled_size=(args.side_length, args.side_length),
                             side_patch=args.side_patch, padding_ratio=args.padding_ratio,
                             continuous=cont)
+        evalset = CelebAHQ(root=args.root_dir, split='test', subset=-1,
+                            downsampled_size=(args.side_length, args.side_length),
+                            side_patch=args.side_patch, padding_ratio=args.padding_ratio,
+                            continuous=cont)
     elif args.dataset == 'shapenet':
         input_dim, output_dim = 3, 1
         trainset = ShapeNet(root=args.root_dir, split='train', sampling=args.sampling, 
@@ -133,13 +137,15 @@ if __name__ == '__main__':
                             random_scale=args.random_scale, subset=args.render_subset)
         testset = ShapeNet(root=args.root_dir, split='test', sampling=args.sampling, 
                             random_scale=args.random_scale, subset=args.render_subset)
+        evalset = ShapeNet(root=args.root_dir, split='test', sampling=args.sampling,
+                            random_scale=args.random_scale, subset=-1)
     else:
         raise ValueError("Invalid dataset")
 
     dataloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=(not args.compute_latents), num_workers=2)
     train_testloader = torch.utils.data.DataLoader(train_testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
+    evalloader = torch.utils.data.DataLoader(evalset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     # create the model
     inr_loe = INRLoe(
         input_dim=input_dim,
@@ -199,6 +205,8 @@ if __name__ == '__main__':
     else:
         mask_all, mask_psnr = None, None
 
+    # initialize the best psnr
+    best_psnr = 0
     for epoch in range(start_epoch, args.epochs):
         inr_loe.train()
         top_k = args.top_k and epoch >= args.warmup_epochs
@@ -354,11 +362,6 @@ if __name__ == '__main__':
                         wandb.log(log)
         scheduler.step()
 
-        # Render the images
-        if epoch % args.epochs_render == 0:
-            render(args, epoch, inr_loe, train_testloader, blend_alphas, criterion)
-            render(args, epoch, inr_loe, testloader, blend_alphas, criterion, test=True)
-
         # Loggings and saving the model
         psnr_epoch /= len(dataloader)
         acc_epoch /= len(dataloader)
@@ -372,11 +375,37 @@ if __name__ == '__main__':
         if args.learnable_s:
             logging_str += ", cond_s: {:.4f}".format(inr_loe.gate_module.s.item())
         logging.info(logging_str)
-        logging.info("Saving last model at epoch {}...".format(epoch))
 
+        # Render the images and evaluate the model
+        if epoch % args.epochs_render == 0:
+            render(args, epoch, inr_loe, train_testloader, blend_alphas, criterion)
+            render(args, epoch, inr_loe, testloader, blend_alphas, criterion, test=True)
+            # also evaluate the model
+            logging.info("Evaluating the model at epoch {}...".format(epoch))
+            evaluate(args, epoch, inr_loe, evalloader, blend_alphas, criterion)
+
+        # Save the last model
+        logging.info("Saving last model at epoch {}...".format(epoch))
         if not os.path.exists(os.path.join(args.save, "ckpt")):
             os.makedirs(os.path.join(args.save, "ckpt"))
         torch.save(inr_loe.state_dict(), os.path.join(args.save, "ckpt", "inr_loe_last.pt"))
+        # Check if the model is the best, save it if it is
+        if psnr_epoch > best_psnr:
+            best_psnr = psnr_epoch
+            logging.info("Saving best model at epoch {}...".format(epoch))
+            # delete the previous best model if inr_loe_best_*.pt exists
+            for f in os.listdir(os.path.join(args.save, "ckpt")):
+                if f.startswith("inr_loe_best"):
+                    os.remove(os.path.join(args.save, "ckpt", f))
+            torch.save(inr_loe.state_dict(), os.path.join(
+                args.save, 
+                "ckpt", 
+                "inr_loe_best_e{}_psnr{:.4f}.pt".format(
+                    epoch, 
+                    best_psnr
+                ))
+            )
+        # Save the model every args.epochs_save
         if epoch % args.epochs_save == 0:
             logging.info("Saving model...")
             torch.save(inr_loe.state_dict(), os.path.join(args.save, "ckpt", "inr_loe_{}.pt".format(epoch)))

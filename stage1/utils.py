@@ -693,3 +693,89 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
     logging.info("Average PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(psnr / len(data_loader),
                                                                             acc / len(data_loader),
                                                                             rec / len(data_loader)))
+
+
+def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
+    """
+    Evaluate the model on the test set
+    """
+    model.eval()
+    psnr = 0
+    acc = 0
+    rec = 0
+    for _, (in_dict, gt_dict) in enumerate(tqdm.tqdm(data_loader)):
+        img = gt_dict["img"].cuda()
+        coords = in_dict["coords"].cuda()
+        N = img.size(0)
+
+        # reset the latents: random sample from N(0, 1)
+        if args.gate_type in ["conditional", "separate"]:
+            latents = torch.zeros(
+                img.size(0), len(args.num_exps), args.latent_size
+            ).cuda()
+        elif args.gate_type == "shared":
+            latents = torch.zeros(img.size(0), args.latent_size).cuda()
+        elif args.gate_type == 'direct':
+            # initialize at 1/latent_size
+            latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size
+        else:
+            raise ValueError("Invalid gate type")
+        latents.requires_grad = True
+        lr_inner_eval = args.lr_inner * N / args.batch_size
+
+        # prepare masks when using patchify and padding
+        if args.side_patch > 1 and args.padding_ratio > 0:
+            mask_all, mask_psnr, _ = get_masks(
+                args.side_length, args.side_patch, args.padding_ratio
+            )
+        else:
+            mask_all, mask_psnr = None, None
+
+        if args.dataset == "celeba":
+            C = img.size(1)
+            if args.side_patch > 1 and args.padding_ratio > 0:
+                img = patchify_with_padding(
+                    img, args.side_patch, args.padding_ratio
+                )
+            y = img.reshape(N, C, -1)
+            y = y.permute(0, 2, 1)
+        elif args.dataset == "shapenet":
+            y = img
+
+        # meta_sgd
+        if args.use_meta_sgd:
+            meta_sgd_inner = model.meta_sgd_lrs()
+
+        # determine if to use top_k
+        top_k = args.top_k and epoch >= args.warmup_epochs
+
+        # inner loop for latents update
+        for _ in range(args.inner_steps):
+            out, gates, importance, _ = model(latents, coords, top_k,
+                                            blend_alphas=blend_alphas)
+            loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                                   mask_all=mask_all, mask_psnr=mask_psnr)
+            latent_gradients = \
+                    torch.autograd.grad(loss, latents)[0]
+            
+            if args.use_meta_sgd:
+                latents = latents - lr_inner_eval * (meta_sgd_inner * latent_gradients)
+            else:
+                latents = latents - lr_inner_eval * latent_gradients
+
+        with torch.no_grad():
+            out, gates, importance, _ = model(latents, coords, top_k,
+                                              blend_alphas=blend_alphas)
+        _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
+                                    mask_all=mask_all, mask_psnr=mask_psnr)
+        
+        psnr += psnr_iter
+        if args.dataset == 'shapenet':
+            pred = out >= 0.5
+            pred = pred[mask_psnr] if mask_psnr is not None else pred
+            acc += pred.float().eq(y).float().mean()
+            rec += recall_score(y.cpu().numpy().flatten(), pred.cpu().numpy().flatten())
+
+    logging.info("Average Test PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(psnr / len(data_loader),
+                                                                            acc / len(data_loader),
+                                                                            rec / len(data_loader)))
