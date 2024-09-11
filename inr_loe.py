@@ -86,7 +86,8 @@ if __name__ == '__main__':
     parser.add_argument('--cond_scale', type=float, default=1.0, help='scale for conditional gating')
     parser.add_argument('--learnable_s', action='store_true', help='use learnable s for gating')
     parser.add_argument('--use_meta_sgd', action='store_true', help='use meta sgd for training')
-    parser.add_argument('--outermost_linear', action='store_true', help='use outermost linear layer')
+    parser.add_argument('--outermost_linear', action='store_true', default=True,
+                        help='use outermost linear layer')
     parser.add_argument('--use_noise_input', action='store_true', help='use noise input at each layer')
     parser.add_argument('--bias_patch', action='store_true', help='use bias for patches')
 
@@ -164,7 +165,8 @@ if __name__ == '__main__':
         testset = SRNDatasetsLMDB(args, root=args.root_dir, split='test', resolution=resolution)
         evalset = testset
         args.lindisp = trainset.lindisp 
-        args.white_bkgd = True 
+        args.white_bkgd = True
+        args.outermost_linear = True
     else:
         raise ValueError("Invalid dataset")
 
