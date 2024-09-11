@@ -1,3 +1,4 @@
+import copy
 import logging
 import math
 import os
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 import torchvision
 import tqdm
 from sklearn.metrics import recall_score
+
+from stage1.nerf.helper import *
 
 
 def get_mgrid(sidelen, dim=2, max=1.0, sidepatch=1, padding_ratio=0.):
@@ -238,6 +241,8 @@ def compute_loss(args, epoch, out, y, criterion, gates=None, importance=None, to
         out_psnr = out[mask_psnr].detach() if mask_psnr is not None else out.detach()
         y_psnr = y[mask_psnr].detach() if mask_psnr is not None else y.detach()
         mse = criterion((out_psnr + 1) / 2, (y_psnr + 1) / 2)
+    elif args.dataset == 'srn':
+        mse = criterion((out.detach() + 1) / 2, (y.detach() + 1) / 2)
     else:
         mse = mse.detach()
     psnr = 10 * np.log10(1 / mse.item())
@@ -419,6 +424,17 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     """
     model.eval()
     in_dict, gt_dict = next(iter(render_loader))
+    if args.dataset == 'srn':
+        in_dict_eval, gt_dict_eval = get_samples_for_nerf(
+            args, copy.deepcopy(in_dict), copy.deepcopy(gt_dict),
+            view_num=args.num_view_eval, pixel_sampling=False
+        )
+        img_eval = gt_dict_eval['img'].cuda()
+        coords_eval = in_dict_eval['coords'].cuda()
+
+        in_dict, gt_dict = get_samples_for_nerf(
+            args, in_dict, gt_dict
+        )
     img = gt_dict["img"].cuda()
     coords = in_dict["coords"].cuda()
     N = img.size(0)
@@ -453,7 +469,9 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
         y = img.reshape(N, C, -1)
         y = y.permute(0, 2, 1)  # N_imgs x N_coords x 3
     elif args.dataset == "shapenet":
-        y = img
+        y = img # N_imgs x N_coords x 3
+    elif args.dataset == 'srn':
+        y = img # N_imgs x N_coords x 3
 
     # meta_sgd
     if args.use_meta_sgd:
@@ -467,6 +485,8 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
         out, gates, importance, _ = model(
             latents, coords, top_k, blend_alphas=blend_alphas
         )  # N_imgs x N_coords x out_dim
+        if args.dataset == 'srn':
+            out = nerf_volume_rendering(args, out, in_dict)
         loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
                                mask_all=mask_all, mask_psnr=mask_psnr)
         latent_gradients = torch.autograd.grad(loss, latents)[0]
@@ -477,9 +497,15 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
             latents = latents - lr_inner_render * latent_gradients
 
     with torch.no_grad():
-        out, gates, _, means = model(
-            latents, coords, top_k, blend_alphas=blend_alphas
-        )
+        if args.dataset == 'srn':
+            out, gates, _, means = model(
+                latents, coords_eval, top_k, blend_alphas=blend_alphas
+            )
+            out = nerf_volume_rendering(args, out, in_dict_eval, 'all')
+        else: 
+            out, gates, _, means = model(
+                latents, coords, top_k, blend_alphas=blend_alphas
+            )
         if mask_psnr is not None:
             # mask_psnr shape: H*W. Need to reshape to (N, H*W, C) as y
             mask_psnr = mask_psnr.unsqueeze(0).unsqueeze(-1).expand_as(out)
@@ -532,6 +558,192 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
             bbox_inches="tight",
             dpi=300,
         )
+
+    elif args.dataset == 'srn':
+        save_rendering_output(out, img_eval, os.path.join(
+            save_path, f'output_{mode}_e_{epoch}.png'
+        ))
+
+    if test:
+        return
+
+    # Uncomment to render the interpolation images
+    # TODO: update the interp render for voxel
+    # render_interp(args, epoch, model, latents[:4], blend_alphas=blend_alphas, num_steps=10)
+    # render_interp_condition(args, epoch, model, latents[:2], blend_alphas=blend_alphas, num_steps=10)
+    # render_sample(args, epoch, model, blend_alphas)
+
+    # save the gates
+    save_path = os.path.join(args.save, "gates")
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    gates = [gate.detach().cpu().numpy() for gate in gates]
+    fig, axes = plt.subplots(1, len(gates), figsize=(16, 6))
+    for j, gate in enumerate(gates):
+        cax = axes[j].imshow(gate, aspect="auto")
+        axes[j].set_yticks([])
+        axes[j].set_xticks([0, gate.shape[1] - 1])
+        cbar = fig.colorbar(cax, ax=axes[j], orientation="horizontal")
+        min_val, max_val = gate.min(), gate.max()
+        cbar.set_ticks([min_val, max_val])
+        # write title to be the mean std
+        std_gate = gate.std(axis=0).mean()
+        # normalize the gate and compute std
+        gate_norm = gate / np.linalg.norm(gate, axis=1, keepdims=True)
+        # gate_norm = gate - gate.mean(axis=0)
+        std_gate_norm = gate_norm.std(axis=0).mean()
+        axes[j].set_title("std: {:.4f} | std_norm: {:.4f}".format(std_gate, std_gate_norm))
+    plt.subplots_adjust(wspace=0.4)
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(save_path, f"gates_train_e_{epoch}.png"),
+        bbox_inches="tight",
+        dpi=300,
+    )
+
+    # save the means if available
+    if means is not None:
+        save_path = os.path.join(args.save, "means")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        means = [mean.detach().cpu().numpy() for mean in means]
+        fig, axes = plt.subplots(1, len(means), figsize=(8, 2))
+        for j, mean in enumerate(means):
+            cax = axes[j].imshow(mean, aspect="auto")
+            axes[j].set_yticks([])
+            axes[j].set_xticks([0, mean.shape[1] - 1])
+            cbar = fig.colorbar(cax, ax=axes[j], orientation="horizontal")
+            min_val, max_val = mean.min(), mean.max()
+            cbar.set_ticks([min_val, max_val])
+            std_mean = mean.std(axis=0).mean()
+            axes[j].set_title("std: {:.4f}".format(std_mean)) 
+        plt.subplots_adjust(wspace=0.4)
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(save_path, f"means_train_e_{epoch}.png"),
+            bbox_inches="tight",
+            dpi=300,
+        )
+    # close the figure
+    plt.close("all")
+
+
+def render_autodecoding(args, epoch, latents_all, model, render_loader, blend_alphas, criterion, test=False):
+    """
+    Render the images, gates, and optionally the means(for conditional gate) and interpolations
+    """
+    model.eval()
+    in_dict, gt_dict = next(iter(render_loader))
+    if args.dataset == 'srn':
+        in_dict_eval, gt_dict_eval = get_samples_for_nerf(
+            args, copy.deepcopy(in_dict), copy.deepcopy(gt_dict),
+            view_num=args.num_view_eval, pixel_sampling=False
+        )
+        img_eval = gt_dict_eval['img'].cuda()
+        coords_eval = in_dict_eval['coords'].cuda()
+
+        in_dict, gt_dict = get_samples_for_nerf(
+            args, in_dict, gt_dict
+        )
+    img = gt_dict["img"].cuda()
+    idx = in_dict['idx'].cuda()
+    coords = in_dict["coords"].cuda()
+    N = img.size(0)
+
+    latents = latents_all[idx].clone().detach()
+
+    # prepare masks when using patchify and padding
+    if args.side_patch > 1 and args.padding_ratio > 0:
+        mask_all, mask_psnr, _ = get_masks(
+            args.side_length, args.side_patch, args.padding_ratio
+        )
+    else:
+        mask_all, mask_psnr = None, None
+
+    if args.dataset == "celeba":
+        C = img.size(1)
+        if args.side_patch > 1 and args.padding_ratio > 0:
+            img = patchify_with_padding(
+                img, args.side_patch, args.padding_ratio
+            )
+        y = img.reshape(N, C, -1)
+        y = y.permute(0, 2, 1)  # N_imgs x N_coords x 3
+    elif args.dataset == "shapenet":
+        y = img # N_imgs x N_coords x 3
+    elif args.dataset == 'srn':
+        y = img # N_imgs x N_coords x 3
+
+    # determine if to use top_k
+    top_k = args.top_k and epoch >= args.warmup_epochs
+
+    with torch.no_grad():
+        if args.dataset == 'srn':
+            out, gates, _, means = model(
+                latents, coords_eval, top_k, blend_alphas=blend_alphas
+            )
+            out = nerf_volume_rendering(args, out, in_dict_eval, 'all')
+        else: 
+            out, gates, _, means = model(
+                latents, coords, top_k, blend_alphas=blend_alphas
+            )
+        if mask_psnr is not None:
+            # mask_psnr shape: H*W. Need to reshape to (N, H*W, C) as y
+            mask_psnr = mask_psnr.unsqueeze(0).unsqueeze(-1).expand_as(out)
+            out = out[mask_psnr]
+
+    mode = "test" if test else "train"
+    save_path = os.path.join(args.save, mode)
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
+    if args.dataset == "celeba":
+        out = out.reshape(N, args.side_length, args.side_length, -1)
+        out = out.permute(0, 3, 1, 2)
+        # from -1, 1 to 0, 1
+        out = (out + 1) / 2
+        out = torch.clamp(out, 0, 1)
+        grid_samples = torchvision.utils.make_grid(out, nrow=int(math.sqrt(N)))
+        torchvision.utils.save_image(
+            grid_samples, os.path.join(save_path, f"output_{mode}_e_{epoch}.png")
+        )
+
+    elif args.dataset == "shapenet":
+        # find the valid coords (out >= 0.5)
+        valid = (out >= 0.5).float().squeeze()
+        valid_coords = [coords[i][valid[i].bool()].cpu().numpy() for i in range(N)]
+        # plot the 3D scatter plot
+        fig = plt.figure()
+        M = int(math.sqrt(N))
+        for i, points in enumerate(valid_coords):
+            ax = fig.add_subplot(M, M, i + 1, projection="3d")
+            x, y, z = points[:, 0], points[:, 1], points[:, 2]
+            ax.scatter(x, y, z, s=0.5, c=z, cmap="rainbow")
+            ax.view_init(elev=30, azim=45)
+            # if points are all zeros, set the limit to be -1, 1
+            if np.allclose(points, 0):
+                min_lim, max_lim = -1, 1
+            else:
+                min_lim, max_lim = points.min(), points.max()
+            ax.set_xlim(min_lim, max_lim)
+            ax.set_ylim(min_lim, max_lim)
+            ax.set_zlim(min_lim, max_lim)
+            ax.set_box_aspect([1, 1, 1])
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_zticks([min_lim, max_lim])
+            ax.grid(False)
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(save_path, f"output_{mode}_e_{epoch}.png"),
+            bbox_inches="tight",
+            dpi=300,
+        )
+
+    elif args.dataset == 'srn':
+        save_rendering_output(out, img_eval, os.path.join(
+            save_path, f'output_{mode}_e_{epoch}.png'
+        ))
+
     if test:
         return
 
@@ -704,6 +916,17 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
     acc = 0
     rec = 0
     for _, (in_dict, gt_dict) in enumerate(tqdm.tqdm(data_loader)):
+        if args.dataset == 'srn':
+            # in_dict_eval, gt_dict_eval = get_samples_for_nerf(
+            #     args, copy.deepcopy(in_dict), copy.deepcopy(gt_dict),
+            #     view_num=args.num_view_eval, pixel_sampling=False
+            # )
+            # img_eval = gt_dict_eval['img'].cuda()
+            # coords_eval = in_dict_eval['coords'].cuda()
+
+            in_dict, gt_dict = get_samples_for_nerf(
+                args, in_dict, gt_dict
+            )
         img = gt_dict["img"].cuda()
         coords = in_dict["coords"].cuda()
         N = img.size(0)
@@ -741,6 +964,8 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
             y = y.permute(0, 2, 1)
         elif args.dataset == "shapenet":
             y = img
+        elif args.dataset == 'srn':
+            y = img # N_imgs x N_coords x 3
 
         # meta_sgd
         if args.use_meta_sgd:
@@ -753,6 +978,8 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
         for _ in range(args.inner_steps):
             out, gates, importance, _ = model(latents, coords, top_k,
                                             blend_alphas=blend_alphas)
+            if args.dataset == 'srn':
+                out = nerf_volume_rendering(args, out, in_dict)
             loss, _ = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
                                    mask_all=mask_all, mask_psnr=mask_psnr)
             latent_gradients = \
@@ -766,6 +993,8 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
         with torch.no_grad():
             out, gates, importance, _ = model(latents, coords, top_k,
                                               blend_alphas=blend_alphas)
+            if args.dataset == 'srn':
+                out = nerf_volume_rendering(args, out, in_dict)
         _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
                                     mask_all=mask_all, mask_psnr=mask_psnr)
         

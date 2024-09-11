@@ -169,16 +169,12 @@ class ConditionalGateModule(nn.Module):
                 self.mean_module.append(nn.Sequential(
                     nn.Linear(gate_out, gate_out//4),
                     nn.LeakyReLU(0.1),
-                    nn.Linear(gate_out//4, latent_size),
+                    nn.Linear(gate_out//4, 2 * latent_size),
                 ))
 
         # init output of each layer to be uniform
         for i, net in enumerate(self.gate_module):
-            # set the last linear layer's bias (for exps) to be uniform
-            # kaiming uniform initialization the weights of the last layer
-            # nn.init.kaiming_uniform_(net[-1].weight, nonlinearity='linear')
-            net[-1].bias.data[:num_exps[i]].fill_(1 / num_exps[i])
-            net[-1].bias.data[num_exps[i]:].fill_(0)
+            net[-1].bias.data.fill_(1 / num_exps[i])
 
         # for i, net in enumerate(self.mean_module):
         #     net[-1].bias.data.fill_(1)
@@ -186,7 +182,8 @@ class ConditionalGateModule(nn.Module):
 
     def forward(self, latents, step=None):
         # latents is N_imgs x N_layers x latent_size
-        N = latents.shape[0]
+        N = latents.shape[0]    # N_imgs
+        H = latents.shape[-1]   # latent_size
         gates = []
         means = []
         biases = [] if self.bias_patch else None
@@ -198,7 +195,7 @@ class ConditionalGateModule(nn.Module):
             if i == 0:
                 latents_rprm = latents_i # N_imgs x latent_size
             else:
-                latents_rprm = mean * latents_i  # N_imgs x latent_size
+                latents_rprm = mean[:, :H] * latents_i + mean[:, H:] # N_imgs x latent_size
                 # latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
             gate_raw = net(latents_rprm) # N_imgs x gate_out
             if i < len(self.gate_module) - 1:
@@ -395,7 +392,7 @@ class INRLoe(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim * self.num_exps[i + 1]), self.nl
                 )
             )
-        if self.outermost_linear:
+        if not self.outermost_linear:
             self.net_param.append(
                 nn.Sequential(nn.Linear(hidden_dim, output_dim * self.num_exps[-1], self.nl))
             )
@@ -422,7 +419,7 @@ class INRLoe(nn.Module):
             if self.use_noise_input:
                 self.net.append(NoiseCombiner(hidden_dim))
 
-        if self.outermost_linear:
+        if not self.outermost_linear:
             self.net.append(
                 MetaSequential(BatchLinear(hidden_dim, output_dim, self.nl))
             )
