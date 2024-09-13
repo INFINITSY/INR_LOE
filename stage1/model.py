@@ -137,6 +137,93 @@ class MoECombiner(torch_geometric.nn.conv.MessagePassing):
         return x_j * edge_weights
 
 
+class HybridGateModule(nn.Module):
+    def __init__(self, latent_size, dims=[64, 64, 64, 3], num_exps=[64, 64, 64, 64], 
+                 npatch=1, bias_patch=False):
+        super().__init__()
+        self.num_exps = num_exps
+        self.npatch = npatch
+        self.dims = dims
+        self.bias_patch = bias_patch
+        nlayer = len(num_exps)
+        self.global_gate_module = nn.Linear(latent_size, nlayer * latent_size)
+        self.gate_module = nn.ModuleList()
+        self.mean_module = nn.ModuleList()
+        # output gating vector for each layer plus mean and std for subsequent layer
+        for i in range(len(num_exps)):
+            # self.nets.append(nn.Linear(latent_size, num_exps[i] + 1 * latent_size))
+            # gate_in = latent_size if i == 0 else latent_size * 2
+            gate_in = latent_size * 2
+            if bias_patch:
+                # all patch share the same gate but different bias
+                gate_out = num_exps[i] + npatch * dims[i]
+            else:
+                # each patch has its own gate
+                gate_out = npatch * num_exps[i]
+
+            self.gate_module.append(nn.Sequential(
+                nn.Linear(gate_in, gate_out),
+                # nn.LeakyReLU(0.1),
+                # nn.Linear(num_exps[i], num_exps[i]),
+            ))
+            if i < len(num_exps) - 1:
+                # for the next layer
+                self.mean_module.append(nn.Sequential(
+                    nn.Linear(gate_out, gate_out//4),
+                    nn.LeakyReLU(0.1),
+                    nn.Linear(gate_out//4, latent_size),
+                ))
+
+        # init output of each layer to be uniform
+        for i, net in enumerate(self.gate_module):
+            net[-1].bias.data.fill_(1 / num_exps[i])
+
+        # for i, net in enumerate(self.mean_module):
+        #     net[-1].bias.data.fill_(1)
+        #     net[-1].weight.data.fill_(0)
+
+    def forward(self, latents, step=None):
+        # latents is N_imgs x N_layers x latent_size
+        N = latents.shape[0]    # N_imgs
+        H = latents.shape[-1]   # latent_size
+        gates = []
+        means = []
+        biases = [] if self.bias_patch else None
+
+        global_latent = self.global_gate_module(latents[:, 0]) # N_imgs x (nlayer * latent_size)
+        global_latent = torch.split(global_latent, H, dim=-1) # tuple of len(num_exps) tensors of shape N_imgs x latent_size
+        latents = latents[:, 1:]
+
+        for i, net in enumerate(self.gate_module):
+            latents_i = latents[:, i]
+            global_latent_i = global_latent[i] # N_imgs x num_exps[i]
+            if step is not None and (i > step or i < step - 2):
+                latents_i = latents_i.detach()
+            if i == 0:
+                latents_rprm = latents_i # N_imgs x latent_size
+            else:
+                latents_rprm = mean * latents_i # N_imgs x latent_size
+            latents_rprm = torch.cat([global_latent_i, latents_rprm], dim=1) # N_imgs x (2 * latent_size)
+                # latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
+            gate_raw = net(latents_rprm) # N_imgs x gate_out
+            if i < len(self.gate_module) - 1:
+                # for the next layer
+                mean = self.mean_module[i](gate_raw)  # N_imgs x latent_size
+                means.append(mean)
+            if self.bias_patch:
+                gate, bias = gate_raw[:, :self.num_exps[i]], gate_raw[:, self.num_exps[i]:]
+                gate = gate.unsqueeze(1).expand(-1, self.npatch, -1).reshape(N * self.npatch, -1) # (N_imgs * npatch) x num_exps[i]
+                bias = bias.reshape(N * self.npatch, -1) # (N_imgs * npatch) x hidden_size
+                biases.append(bias)
+            else:
+                gate = gate_raw.view(N * self.npatch, self.num_exps[i]) # (N_imgs * npatch) x num_exps[i]
+            gates.append(gate)
+
+        gates = torch.cat(gates, dim=-1)  # (N_imgs * npatch) x sum(num_exps)
+        biases = torch.cat(biases, dim=-1) if self.bias_patch else None # (N_imgs * npatch) x sum(dims)
+
+        return gates, means, biases
+
 class ConditionalGateModule(nn.Module):
     def __init__(self, latent_size, dims=[64, 64, 64, 3], num_exps=[64, 64, 64, 64], 
                  npatch=1, bias_patch=False):
@@ -169,7 +256,7 @@ class ConditionalGateModule(nn.Module):
                 self.mean_module.append(nn.Sequential(
                     nn.Linear(gate_out, gate_out//4),
                     nn.LeakyReLU(0.1),
-                    nn.Linear(gate_out//4, 2 * latent_size),
+                    nn.Linear(gate_out//4, latent_size),
                 ))
 
         # init output of each layer to be uniform
@@ -195,7 +282,7 @@ class ConditionalGateModule(nn.Module):
             if i == 0:
                 latents_rprm = latents_i # N_imgs x latent_size
             else:
-                latents_rprm = mean[:, :H] * latents_i + mean[:, H:] # N_imgs x latent_size
+                latents_rprm = mean * latents_i # N_imgs x latent_size
                 # latents_rprm = torch.cat([means[-1], latents_i], dim=1) # N_imgs x (2 * latent_size)
             gate_raw = net(latents_rprm) # N_imgs x gate_out
             if i < len(self.gate_module) - 1:
@@ -374,6 +461,8 @@ class INRLoe(nn.Module):
                 meta_lr_size = latent_size
             elif self.gate_type in ["conditional", "separate", "direct"]:
                 meta_lr_size = (len(num_exps), latent_size)
+            elif self.gate_type == "hybrid":
+                meta_lr_size = (len(num_exps) + 1, latent_size)
             self.meta_sgd_lrs = MetaSGDLrs(meta_lr_size,
                                            self.meta_sgd_init_range,
                                            self.meta_sgd_clip_range)
@@ -452,6 +541,12 @@ class INRLoe(nn.Module):
                 )
         elif self.gate_type == "direct":
             self.gate_module = DirectGateModule(latent_size, num_exps=self.num_exps)
+        elif self.gate_type == 'hybrid':
+            self.gate_module = HybridGateModule(
+                latent_size, dims=self.dims,
+                num_exps=self.num_exps, npatch=self.npatch,
+                bias_patch=self.bias_patch
+            )
         else:
             raise ValueError(f"Unsupported gate type: {self.gate_type}")
 
@@ -533,7 +628,7 @@ class INRLoe(nn.Module):
         coords = coords.view(-1, coords.shape[-2], coords.shape[-1])
         # shape of coords: (N_imgs * npatch) x N_coords x input_dim
 
-        if self.gate_type == "conditional":
+        if self.gate_type in ["conditional", "hybrid"]:
             raw_gates, means, biases = self.gate_module(latents, step)
         else:
             raw_gates = self.gate_module(latents)

@@ -447,6 +447,10 @@ def render(args, epoch, model, render_loader, blend_alphas, criterion, test=Fals
     elif args.gate_type == 'direct':
         # initialize at 1/latent_size
         latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size
+    elif args.gate_type == 'hybrid':
+        latents = torch.zeros(
+            img.size(0), len(args.num_exps) + 1, args.latent_size
+        ).cuda()
     else:
         raise ValueError("Invalid gate type")
     latents.requires_grad = True
@@ -833,6 +837,10 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
         elif args.gate_type == 'direct':
             # initialize at 1/latent_size
             latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size
+        elif args.gate_type == 'hybrid':
+            latents = torch.zeros(
+                img.size(0), len(args.num_exps) + 1, args.latent_size
+            ).cuda()
         else:
             raise ValueError("Invalid gate type")
         latents.requires_grad = True
@@ -941,6 +949,10 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
         elif args.gate_type == 'direct':
             # initialize at 1/latent_size
             latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size
+        elif args.gate_type == 'hybrid':
+            latents = torch.zeros(
+                img.size(0), len(args.num_exps) + 1, args.latent_size
+            ).cuda()
         else:
             raise ValueError("Invalid gate type")
         latents.requires_grad = True

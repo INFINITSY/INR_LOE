@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=str, default=None)
 
     # data loader
-    parser.add_argument('--dataset', type=str, default='srn', help='dataset name')
+    parser.add_argument('--dataset', type=str, default='celeba', help='dataset name')
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--train_subset', type=int, default=-1)
     parser.add_argument('--render_subset', type=int, default=9)
@@ -82,7 +82,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_hidden', type=int, default=4, help='number of hidden layers')
     parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim of each expert')
     parser.add_argument('--std_latent', type=float, default=0.0001, help='std of latent sampling')
-    parser.add_argument('--gate_type', type=str, default='conditional', help='gating type: separate, conditional, shared, or direct')
+    parser.add_argument('--gate_type', type=str, default='hybrid', help='gating type: separate, conditional, shared, or direct')
     parser.add_argument('--cond_scale', type=float, default=1.0, help='scale for conditional gating')
     parser.add_argument('--learnable_s', action='store_true', help='use learnable s for gating')
     parser.add_argument('--use_meta_sgd', action='store_true', help='use meta sgd for training')
@@ -271,6 +271,8 @@ if __name__ == '__main__':
                 # initialize around 1/latent_size
                 latents = torch.ones(img.size(0), len(args.num_exps), args.latent_size).cuda() / args.latent_size + \
                             torch.randn(img.size(0), len(args.num_exps), args.latent_size).cuda() * args.std_latent
+            elif args.gate_type == 'hybrid':
+                latents = torch.randn(img.size(0), len(args.num_exps) + 1, args.latent_size).cuda() * args.std_latent
             else:
                 raise ValueError("Invalid gate type")
             latents.requires_grad = True
@@ -361,13 +363,24 @@ if __name__ == '__main__':
                     logging_str += ", cond_s: {:.4f}".format(inr_loe.gate_module.s.item())
                 # compute mean abs of latents and means per layer
                 for l in range(latents.size(1)):
-                    if l == 0:
-                        logging_str += ", l_{}: {:.4f}".format(l, latents[:, l].abs().mean().item())
+                    if args.gate_type == 'hybrid':
+                        if l == 0:
+                            logging_str += ", global_l: {:.4f}".format(latents[:, l].abs().mean().item())
+                        elif l == 1:
+                            logging_str += ", l_{}: {:.4f}".format(l-1, latents[:, l].abs().mean().item())
+                        else:
+                            logging_str += ", l_{}: {:.4f}/{:.4f}".format(
+                                l-1, 
+                                latents[:, l].abs().mean().item(),
+                                means[l-2].abs().mean().item())
                     else:
-                        logging_str += ", l_{}: {:.4f}/{:.4f}".format(
-                            l, 
-                            latents[:, l].abs().mean().item(),
-                            means[l-1].abs().mean().item())
+                        if l == 0:
+                            logging_str += ", l_{}: {:.4f}".format(l, latents[:, l].abs().mean().item())
+                        else:
+                            logging_str += ", l_{}: {:.4f}/{:.4f}".format(
+                                l, 
+                                latents[:, l].abs().mean().item(),
+                                means[l-1].abs().mean().item())
                 if args.ort_loss_w > 0:
                     logging_str += ", ort_loss: {:.4f}".format(ort_loss.item())
                 logging.info(logging_str)
