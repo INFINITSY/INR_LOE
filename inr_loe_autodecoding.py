@@ -164,6 +164,7 @@ if __name__ == '__main__':
         evalset = testset
         args.lindisp = trainset.lindisp 
         args.white_bkgd = True 
+        args.outermost_linear = True
     else:
         raise ValueError("Invalid dataset")
 
