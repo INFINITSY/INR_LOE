@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torchvision
 import tqdm
 from sklearn.metrics import recall_score
+from skimage.metrics import structural_similarity as ssim
 
 from stage1.nerf.helper import *
 
@@ -818,6 +819,7 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
 
     latents_all = []
     means_all = []
+    ssim = 0
     psnr = 0
     acc = 0
     rec = 0
@@ -891,7 +893,9 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
                                               blend_alphas=blend_alphas)
         _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
                                     mask_all=mask_all, mask_psnr=mask_psnr)
-        
+        ssim_iter = compute_ssim(out, y)
+
+        ssim += ssim_iter
         psnr += psnr_iter
         if args.dataset == 'shapenet':
             pred = out >= 0.5
@@ -910,9 +914,25 @@ def compute_latents(args, epoch, model, data_loader, blend_alphas, criterion, te
     if means_all:
         means_all = torch.cat(means_all, dim=0)
         torch.save(means_all, os.path.join(args.save, f"means_{split}_e_{epoch}.pt"))
-    logging.info("Average PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(psnr / len(data_loader),
-                                                                            acc / len(data_loader),
-                                                                            rec / len(data_loader)))
+    logging.info("Average PSNR: {:.4f}, SSIM: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
+        psnr / len(data_loader),
+        ssim / len(data_loader),
+        acc / len(data_loader),
+        rec / len(data_loader)))
+
+
+def compute_ssim(img1, img2):
+    """
+    Compute the SSIM between 2 images of shape N x HW x C
+    """
+    N, HW, C = img1.shape
+    H, W = int(math.sqrt(HW)), int(math.sqrt(HW))
+    img1 = img1.reshape(N, H, W, C).cpu().numpy()
+    img2 = img2.reshape(N, H, W, C).cpu().numpy()
+    ssim_val = 0
+    for i in range(N):
+        ssim_val += ssim(img1[i], img2[i], data_range=1, channel_axis=-1)
+    return ssim_val / N
 
 
 def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
@@ -920,6 +940,7 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
     Evaluate the model on the test set
     """
     model.eval()
+    ssim = 0
     psnr = 0
     acc = 0
     rec = 0
@@ -1010,6 +1031,9 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
         _, psnr_iter = compute_loss(args, epoch, out, y, criterion, gates, importance, top_k,
                                     mask_all=mask_all, mask_psnr=mask_psnr)
         
+        ssim_iter = compute_ssim((out+1)/2, (y+1)/2)
+
+        ssim += ssim_iter
         psnr += psnr_iter
         if args.dataset == 'shapenet':
             pred = out >= 0.5
@@ -1017,6 +1041,8 @@ def evaluate(args, epoch, model, data_loader, blend_alphas, criterion):
             acc += pred.float().eq(y).float().mean()
             rec += recall_score(y.cpu().numpy().flatten(), pred.cpu().numpy().flatten())
 
-    logging.info("Average Test PSNR: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(psnr / len(data_loader),
-                                                                            acc / len(data_loader),
-                                                                            rec / len(data_loader)))
+    logging.info("Average Test PSNR: {:.4f}, SSIM: {:.4f}, Acc: {:.4f}, Recall: {:.4f}".format(
+        psnr / len(data_loader),
+        ssim / len(data_loader),
+        acc / len(data_loader),
+        rec / len(data_loader)))

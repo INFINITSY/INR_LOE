@@ -28,14 +28,50 @@ def get_rays_batch(H, W, focal, c2w, compute_radii=False):
     #results = torch.stack(list(map(lambda f, c: get_rays(H,W,f,c), focal, c2w)), 1)
     return results
 
-def get_samples_for_nerf(args, model_input, gt, resolution=128, view_sampling=True, pixel_sampling=True, view_num=None):
+
+def get_fixed_samples_for_nerf(args, bsz, focal, c2w, resolution=128):
+    H = W = resolution
+    focal = focal
+    c2w = c2w.unsqueeze(0)
+    # get origin & direction of all pixels
+    compute_radii = args.rendering_type == 'mip-nerf'
+    cam_rays = get_rays_batch(H, W, focal, c2w, compute_radii=compute_radii) #(2 or 3,NV,H,W,3)
+
+    # sampling [H,W] indices
+    NM = 3 if compute_radii else 2
+
+    assert cam_rays.size(0) == NM and cam_rays.size(1) == 1 and cam_rays.size(4) == 3
+
+    cam_rays = cam_rays.permute(0, 1, 4, 2, 3) #(2,1,3,H,W)
+    cam_rays = cam_rays.reshape(NM, 1, 3, -1) #(2,1,3,H*W)
+
+    cam_rays = cam_rays.permute(0, 1, 3, 2) #(2,NV,NP,3)
+    all_scene_rays = cam_rays.repeat(1, bsz, 1, 1).reshape(NM, -1, 3) #(3,B*NV*NP,3)
+    if args.rendering_type == 'mip-nerf':
+        t_vals, (coords, coords_covs) = sample_along_rays_mip(all_scene_rays, args)
+    else:
+        t_vals, coords = sample_along_rays(all_scene_rays, args)
+    
+    coords = coords.reshape(bsz, -1, 3)
+
+    # Model input
+    model_input = {}
+    model_input['coords'] = coords
+    model_input['rays_d'] = all_scene_rays[1]
+    model_input['t_vals'] = t_vals
+
+    return model_input
+
+
+def get_samples_for_nerf(args, model_input, gt, resolution=128, view_sampling=True, pixel_sampling=True, view_num=None, fix_pose=False):
     all_scene_rays = []
     all_scene_rgb = []
     all_scene_idx = []
     ALL_VIEW = gt['img'].shape[1]
     bsz = gt['img'].shape[0]
     H = W = resolution
-
+    if fix_pose:
+        c2w_fix = model_input['c2w'][0][0:1]
     for i_batch in range(bsz):
         focal = model_input['focal'][i_batch] #(ALL_VIEW)
         c2w =  model_input['c2w'][i_batch] #(ALL_VIEW,4,4)
@@ -43,7 +79,12 @@ def get_samples_for_nerf(args, model_input, gt, resolution=128, view_sampling=Tr
         rgb = gt['img'][i_batch] #(ALL_VIEW,3,H,W)
 
         # sampling view
-        if view_sampling:
+        if fix_pose:
+            NV = 1
+            focal = focal.repeat(NV)
+            c2w = c2w_fix
+            rgb = rgb[0:1, :, :, :]
+        elif view_sampling:
             NV = args.subsampled_views if view_num is None else view_num
             view_inds = np.random.choice(ALL_VIEW, NV)
             focal = focal.repeat(NV)
