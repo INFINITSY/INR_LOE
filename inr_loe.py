@@ -82,7 +82,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_hidden', type=int, default=4, help='number of hidden layers')
     parser.add_argument('--hidden_dim', type=int, default=64, help='hidden layer dim of each expert')
     parser.add_argument('--std_latent', type=float, default=0.0001, help='std of latent sampling')
-    parser.add_argument('--gate_type', type=str, default='hybrid', help='gating type: separate, conditional, shared, or direct')
+    parser.add_argument('--gate_type', type=str, default='conditional', help='gating type: separate, conditional, shared, or direct')
     parser.add_argument('--cond_scale', type=float, default=1.0, help='scale for conditional gating')
     parser.add_argument('--learnable_s', action='store_true', help='use learnable s for gating')
     parser.add_argument('--use_meta_sgd', action='store_true', help='use meta sgd for training')
@@ -362,25 +362,32 @@ if __name__ == '__main__':
                 if args.learnable_s:
                     logging_str += ", cond_s: {:.4f}".format(inr_loe.gate_module.s.item())
                 # compute mean abs of latents and means per layer
-                for l in range(latents.size(1)):
-                    if args.gate_type == 'hybrid':
-                        if l == 0:
-                            logging_str += ", global_l: {:.4f}".format(latents[:, l].abs().mean().item())
-                        elif l == 1:
-                            logging_str += ", l_{}: {:.4f}".format(l-1, latents[:, l].abs().mean().item())
+                if not args.gate_type == 'shared':
+                    for l in range(latents.size(1)):
+                        if args.gate_type == 'hybrid':
+                            if l == 0:
+                                logging_str += ", global_l: {:.4f}".format(latents[:, l].abs().mean().item())
+                            elif l == 1:
+                                logging_str += ", l_{}: {:.4f}".format(l-1, latents[:, l].abs().mean().item())
+                            else:
+                                if means is not None:
+                                    logging_str += ", l_{}: {:.4f}/{:.4f}".format(
+                                        l-1, 
+                                        latents[:, l].abs().mean().item(),
+                                        means[l-2].abs().mean().item())
+                                else:
+                                    logging_str += ", l_{}: {:.4f}".format(l-1, latents[:, l].abs().mean().item())
+                        elif args.gate_type == 'conditional':
+                            if l == 0:
+                                logging_str += ", l_{}: {:.4f}".format(l, latents[:, l].abs().mean().item())
+                            else:
+                                logging_str += ", l_{}: {:.4f}/{:.4f}".format(
+                                    l, 
+                                    latents[:, l].abs().mean().item(),
+                                    means[l-1].abs().mean().item())
                         else:
-                            logging_str += ", l_{}: {:.4f}/{:.4f}".format(
-                                l-1, 
-                                latents[:, l].abs().mean().item(),
-                                means[l-2].abs().mean().item())
-                    else:
-                        if l == 0:
                             logging_str += ", l_{}: {:.4f}".format(l, latents[:, l].abs().mean().item())
-                        else:
-                            logging_str += ", l_{}: {:.4f}/{:.4f}".format(
-                                l, 
-                                latents[:, l].abs().mean().item(),
-                                means[l-1].abs().mean().item())
+      
                 if args.ort_loss_w > 0:
                     logging_str += ", ort_loss: {:.4f}".format(ort_loss.item())
                 logging.info(logging_str)
